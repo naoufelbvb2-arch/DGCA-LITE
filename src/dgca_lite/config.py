@@ -1,4 +1,4 @@
-"""Calibration surface and invariant validation for Core v0.3."""
+"""Calibration surface and invariant validation for Core v0.4."""
 
 from __future__ import annotations
 
@@ -82,8 +82,13 @@ class CoreConfig:
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
-        if self.temporal_horizon < 0:
-            raise ValueError("temporal_horizon must be nonnegative")
+        if self.temporal_horizon < 1:
+            raise ValueError("temporal_horizon must be at least one")
+        language_capacity = (self.logical_capacity + 2) // 3
+        if self.receptor_fanout > language_capacity:
+            raise ValueError(
+                "receptor_fanout exceeds addressable LANGUAGE receptor capacity"
+            )
         if not 0 < self.theta_active <= self.theta_emit <= 1:
             raise ValueError("0 < theta_active <= theta_emit <= 1 is required")
         for name in (
@@ -136,4 +141,3 @@ class CoreConfig:
     @classmethod
     def from_dict(cls, values: dict[str, Any]) -> CoreConfig:
         return cls(**values)
-

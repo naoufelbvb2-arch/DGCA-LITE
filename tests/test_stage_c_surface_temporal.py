@@ -43,6 +43,14 @@ def test_unknown_features_need_no_vocabulary_mutation() -> None:
     assert len(codec.project(feature)) == 3
 
 
+def test_projection_at_language_capacity_is_bounded_and_unique() -> None:
+    config = CoreConfig(logical_capacity=4, receptor_fanout=2, local_radius=0.1)
+    codec = SurfaceCodec(config, Topology(config))
+    projected = codec.project(SurfaceFeature("X", b"capacity-boundary"))
+    assert len(projected) == len(set(projected)) == 2
+    assert set(projected) == {0, 1}
+
+
 def test_projection_collisions_cannot_break_decode() -> None:
     config = CoreConfig(logical_capacity=30, receptor_fanout=2, max_neighborhood=8)
     codec = SurfaceCodec(config, Topology(config))

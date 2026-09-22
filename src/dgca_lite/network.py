@@ -116,6 +116,7 @@ class SparseNetwork:
             outgoing=_ReadOnlyAdjacency(self.outgoing),
             incoming=_ReadOnlyIncoming(self.incoming),
             assemblies=MappingProxyType(self.assemblies),
+            assembly_index=MappingProxyType(self._assembly_by_members),
             memberships=MappingProxyType(self.memberships),
             active_ids=frozenset(self.active_ids),
         )

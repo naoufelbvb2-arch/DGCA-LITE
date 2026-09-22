@@ -1,9 +1,9 @@
 # DGCA LITE — Layer 1: Core Architecture and Unified Learning Algorithm
 
-**Canonical Implementation Specification — v0.3**  
-**Status:** SPECIFICATION CLOSED · READY FOR IMPLEMENTATION · CODE PENDING  
+**Canonical Implementation Specification — v0.4**  
+**Status:** SPECIFICATION CLOSED · READY FOR CONFORMANCE REPAIR · BASELINE CODE EXISTS  
 **Learning specification:** DGCA LITE Learning Algorithm (LLA v0)  
-**Date:** 21 September 2026
+**Date:** 22 September 2026
 
 ---
 
@@ -629,6 +629,31 @@ where `Memberships(x)` is the bounded Assembly-membership index for Cell `x` in 
 
 This trigger is sufficient because `D` can change only through reciprocal LOCAL support and `Spec` can change through reciprocal LOCAL or ASSOCIATIVE support. Candidate-only changes that leave both derived reciprocal supports unchanged do not trigger MAINTAIN.
 
+#### 8.7.2 Canonical exact-member-set collision arbitration
+
+MAINTAIN may lawfully cause two distinct pre-existing Assemblies to collapse to the same final member set. Exact duplicate member sets are forbidden, so the collision must be resolved before GROW begins.
+
+For every surviving MAINTAIN outcome `A -> G`, perform an exact-set lookup against:
+
+- all other surviving MAINTAIN outcomes in the current bounded workset; and
+- the exact-member-set Assembly index for any pre-existing Assembly outside the MAINTAIN workset whose member set already equals `G`.
+
+This is an exact-index operation only; it must not scan all Assemblies.
+
+For every collision group sharing the same final member set `G`, define the canonical survivor:
+
+\[
+\boxed{A_{survive}=\min\{assembly\_id\mid members(A)=G\}}
+\]
+
+All other Assembly records in that exact-set collision group are deleted in the same structural transaction. Their Synapses are untouched. Membership indexes are updated to reference only the surviving Assembly ID.
+
+This operation is **administrative exact-duplicate elimination**, not `MERGE`: it performs no union of distinct member sets, no averaging or transfer of Synaptic state, and creates no new Assembly identity. Assembly IDs carry no cognitive score or semantic authority; the minimum-ID rule exists only to make duplicate elimination deterministic.
+
+Collision resolution occurs after MAINTAIN fixed points are computed and before GROW metrics/resource counts are frozen. Therefore GROW sees the deduplicated post-MAINTAIN membership overlay.
+
+For GROW, `ResourceValid(x,A)` additionally requires that the proposed exact set `members(A) union {x}` is not already the member set of another surviving Assembly. If it is, that GROW proposal is rejected; GROW never deletes or replaces another Assembly identity to resolve an exact-set collision. FORM retains its existing duplicate-set rejection/deduplication rules.
+
 Assembly structural processing is canonical:
 
 ```text
@@ -753,7 +778,13 @@ For temporal distance `Delta`:
 \end{cases}
 \]
 
-`H` is the bounded temporal learning horizon.
+`H` is the bounded temporal learning horizon. Core v0.4 requires:
+
+\[
+\boxed{H\ge1}
+\]
+
+This lower bound is architectural rather than semantic: at least one bounded temporal record must exist so newly recruited mechanically addressable Cells can remain locally accountable until their provenance either receives structure or expires through the canonical context-eviction workset in Section 16.3. Setting `H=0` is therefore invalid in Core v0.4.
 
 ### 10.3 Hard boundary and root lifecycle
 
@@ -1046,24 +1077,74 @@ Overlapping receptor candidates can be reserved only once in the transaction ove
 
 ### 16.3 Orphan reclamation
 
-A committed Cell is reclaimable only after a structural change when all are true:
+Orphan reclamation is **event-driven and locally triggered**. Core v0.4 does not scan all committed Cells and does not maintain an unbounded orphan scheduler.
 
-- no incident CONSOLIDATED Synapse;
-- no surviving incident CANDIDATE Synapse;
-- no Assembly membership;
-- no current transaction reference;
-- no bounded temporal-context reference;
-- no current ordinary/expansion reservation;
-- numeric activation is below `theta_active`.
+#### 16.3.1 Prospective post-commit temporal context
 
-Exact floating zero is not required. At commit reclamation sets:
+Before orphan evaluation, the engine constructs the deterministic **prospective post-commit temporal context** that would exist if the current tick commits successfully:
+
+1. start from the frozen pre-tick bounded context;
+2. if a `HARD_BOUNDARY` is requested, mark all pre-boundary records for eviction;
+3. include the current event's mechanical Surface provenance and committed learning-active `A+` values;
+4. apply the bounded horizon `H`, identifying any oldest records that would be evicted by the successful append.
+
+These changes are staged only; the live temporal stream is not mutated until the whole tick commits.
+
+A temporal record references both:
+
+- its stored historical learning-active Cell IDs; and
+- the receptor Cell IDs contained in its stored mechanical receptor provenance required for later deterministic expansion/re-addressing.
+
+Let `T_pre` be the Cell IDs referenced by the frozen pre-tick temporal context and `T_post` the IDs referenced by the prospective post-commit context. Define temporal-expiration candidates:
+
+\[
+\boxed{W_{expire}=T_{pre}\setminus T_{post}}
+\]
+
+Because at most `H` bounded temporal records are inspected, this operation is local with respect to temporal context and never scans the Network.
+
+#### 16.3.2 Canonical orphan review workset
+
+Let:
+
+- `W_edge` be endpoints of Synapses deleted/pruned in the current resource transaction;
+- `W_assembly` be Cells removed from Assembly membership by MAINTAIN or by deletion of an Assembly record;
+- `W_expire` be the temporal-expiration set above.
+
+The exact orphan review workset is:
+
+\[
+\boxed{W_{orphan}=W_{edge}\cup W_{assembly}\cup W_{expire}}
+\]
+
+Duplicate Cell IDs are removed and evaluation order is ascending Cell ID. No other committed Cell is inspected for reclamation in that tick.
+
+Current ordinary/expansion allocations remain transaction reservations and cannot be reclaimed during the same tick. To prevent a reservation from becoming permanently unreachable after commit, any expansion receptor chosen from historical provenance must come from a provenance record that survives into the prospective post-commit temporal context. Ordinary recruitment from the current Surface Event is referenced by the current event record because `H >= 1`.
+
+#### 16.3.3 Reclamation predicate
+
+A committed Cell `i in W_orphan` is reclaimable only in the final post-resource/post-Assembly/post-context overlay when all are true:
+
+- no incident CONSOLIDATED Synapse survives;
+- no incident CANDIDATE Synapse survives;
+- no Assembly membership survives;
+- no current transaction reference remains;
+- `i notin T_post`;
+- no current ordinary/expansion reservation targets `i`;
+- post-tick numeric activation is below `theta_active`.
+
+For activation, use the deterministic post-tick activation overlay: `A_i^+` where computed; otherwise the Cell's unchanged canonical activation. Exact floating zero is not required.
+
+At atomic commit reclamation sets:
 
 ```text
 committed = false
 activation = 0
 ```
 
-Its logical ID and deterministic position remain reusable. Reclamation is not time-based forgetting.
+Its logical ID and deterministic position remain reusable. Reclamation is caused only by lawful structural/provenance changes; elapsed time by itself never weakens or deletes knowledge.
+
+The context-eviction trigger closes the tentative-capacity lifecycle: a recruited Cell that never acquires Synaptic or Assembly support is revisited when the last bounded Surface provenance that protects it expires.
 
 ## 17. Assembly Operations Under LLA
 
@@ -1094,21 +1175,21 @@ One external Surface Event is processed in the following canonical order:
 10. Compute S'/E' for existing Synapses.
 11. Apply provisional lifecycle transitions to existing Synapses.
 12. Build absent-edge proposals and resolve per-source budget arbitration/pruning.
-13. Allocate ordinary recruitment, remaining shared expansion recruitment, and lawful reclamation.
+13. Allocate ordinary recruitment and remaining shared expansion recruitment.
 14. Build deterministic post-learning/resource transaction overlay.
-15. MAINTAIN pre-existing Assemblies to bounded local fixed point.
+15. MAINTAIN pre-existing Assemblies to bounded local fixed point, then resolve exact-member-set MAINTAIN collisions.
 16. GROW surviving pre-existing Assemblies using frozen growth metrics and evolving resource checks.
 17. FORM new Assemblies by bounded deterministic BFS and arbitration.
-18. Validate the complete transaction and all invariants.
-19. Atomically commit activation and persistent changes.
-20. Store committed learning-active A+ values and required mechanical Surface provenance in bounded temporal context.
+18. Construct the prospective post-commit temporal context and canonical `W_orphan`; evaluate lawful reclamation on the final structural/context overlay.
+19. Validate the complete Network + temporal transaction and all invariants.
+20. Atomically publish persistent Network changes and the staged temporal/root state as one successful tick.
 21. Finalize the external root and discard its ledger.
 22. Advance to the next external event.
 ```
 
 Newly recruited Cells are administrative recruitment records only during their recruitment tick and are excluded from evidence, CONNECT, propagation, and Assembly processing until a later external event.
 
-All next activation calculations use the pre-tick snapshot. Later structural stages may consume immutable transaction overlays from earlier stages but may never observe a partially mutated live graph.
+All next activation calculations use the pre-tick snapshot. Later structural stages may consume immutable transaction overlays from earlier stages but may never observe a partially mutated live graph. Temporal/root mutations are part of the same transactional authority: a failed tick must leave Network state, temporal context, root-allocation state, and boundary state exactly as they were before the event was accepted.
 
 ### 18.1 Determinism
 
@@ -1632,7 +1713,8 @@ Resource mechanics            COMPLETE
 Deterministic tick semantics  COMPLETE
 Adversarial final review      COMPLETE
 
-Production implementation     PENDING
+Production implementation     BASELINE v0.3 EXISTS
+Conformance repair to v0.4   PENDING
 Acceptance verification       PENDING
 Repository review             PENDING
 Final Layer-1 freeze          PENDING
@@ -1640,7 +1722,7 @@ Final Layer-1 freeze          PENDING
 
 Therefore the correct status is:
 
-> **DGCA LITE Layer 1 Core v0.3 — SPECIFICATION CLOSED, READY FOR IMPLEMENTATION.**
+> **DGCA LITE Layer 1 Core v0.4 — SPECIFICATION CLOSED, READY FOR CONFORMANCE REPAIR.**
 
 The Layer becomes fully `FROZEN` only after implementation, acceptance verification, repository architecture review, and an exact implementation commit are appended to the closure manifest.
 
@@ -1838,7 +1920,7 @@ The following block is intentionally unfilled until implementation is complete.
 
 ```text
 Specification:
-  DGCA LITE Layer 1 Core v0.3
+  DGCA LITE Layer 1 Core v0.4
 
 Implementation repository:
   PENDING
@@ -1865,7 +1947,7 @@ Final frozen specification version:
   PENDING
 
 Status:
-  IMPLEMENTATION PENDING
+  V0.4 CONFORMANCE REPAIR PENDING
 ```
 
 ---

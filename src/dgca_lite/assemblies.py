@@ -1,4 +1,4 @@
-"""Event-driven Assembly MAINTAIN, GROW and FORM for Core v0.3."""
+"""Event-driven Assembly MAINTAIN, GROW and FORM for Core v0.4."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ class AssemblyResult:
     delta_local: frozenset[Pair]
     delta_support: frozenset[Pair]
     maintain_workset: tuple[int, ...]
+    removed_members: frozenset[int]
     assembly_seeds: int
     bfs_visits: int
     grown: int
@@ -268,6 +269,7 @@ def process_assemblies(
     )
     current: dict[int, Assembly] = {}
     deletes: set[int] = set()
+    maintained_outcomes: dict[int, Assembly] = {}
     # This overlay is lazy: only touched Assemblies are copied into ``current``.
     for assembly_id in maintain_ids:
         original = snapshot.assemblies.get(assembly_id)
@@ -276,8 +278,25 @@ def process_assemblies(
         maintained = _maintain(original, overlay, topology, config)
         if maintained is None:
             deletes.add(assembly_id)
-        elif maintained != original:
-            current[assembly_id] = maintained
+        else:
+            maintained_outcomes[assembly_id] = maintained
+            if maintained != original:
+                current[assembly_id] = maintained
+
+    # Canonical administrative exact-set deduplication occurs after all fixed
+    # points are known and before growth metrics/resource counts are frozen.
+    collision_groups: dict[frozenset[int], set[int]] = {}
+    maintain_set = set(maintain_ids)
+    for assembly_id, maintained in maintained_outcomes.items():
+        collision_groups.setdefault(maintained.members, set()).add(assembly_id)
+    for members, assembly_ids in collision_groups.items():
+        indexed = snapshot.assembly_index.get(members)
+        if indexed is not None and indexed not in maintain_set:
+            assembly_ids.add(indexed)
+        survivor = min(assembly_ids)
+        for loser in sorted(assembly_ids - {survivor}):
+            deletes.add(loser)
+            current.pop(loser, None)
 
     def assembly_at(assembly_id: int) -> Assembly | None:
         if assembly_id in deletes:
@@ -299,6 +318,22 @@ def process_assemblies(
                 value -= 1
         membership_counts[member] = value
         return value
+
+    changed_set_owners = {
+        assembly.members: assembly_id
+        for assembly_id, assembly in current.items()
+        if assembly_id not in deletes
+    }
+
+    def exact_set_owner(members: frozenset[int]) -> int | None:
+        changed_owner = changed_set_owners.get(members)
+        if changed_owner is not None and assembly_at(changed_owner) is not None:
+            return changed_owner
+        indexed = snapshot.assembly_index.get(members)
+        if indexed is None:
+            return None
+        assembly = assembly_at(indexed)
+        return indexed if assembly is not None and assembly.members == members else None
 
     growth_identities: set[tuple[int, int]] = set()
     for left, right in sorted(delta_local):
@@ -338,9 +373,16 @@ def process_assemblies(
             len(proposed) > config.K_max
             or topology.diameter(proposed) > config.assembly_radius
             or count(candidate) >= config.M_max
+            or (
+                (owner := exact_set_owner(proposed)) is not None
+                and owner != assembly_id
+            )
         ):
             continue
+        if changed_set_owners.get(assembly.members) == assembly_id:
+            changed_set_owners.pop(assembly.members)
         current[assembly_id] = Assembly(assembly.id, assembly.territory, proposed)
+        changed_set_owners[proposed] = assembly_id
         membership_counts[candidate] = count(candidate) + 1
         grown += 1
 
@@ -397,12 +439,23 @@ def process_assemblies(
         territory = topology.territory(min(members))
         current[assembly_id] = Assembly(assembly_id, territory, members)
 
+    removed_members: set[int] = set()
+    for assembly_id in deletes:
+        original = snapshot.assemblies.get(assembly_id)
+        if original is not None:
+            removed_members.update(original.members)
+    for assembly_id, assembly in current.items():
+        original = snapshot.assemblies.get(assembly_id)
+        if original is not None:
+            removed_members.update(original.members - assembly.members)
+
     return AssemblyResult(
         current,
         frozenset(deletes),
         delta_local,
         delta_support,
         tuple(maintain_ids),
+        frozenset(removed_members),
         len(seeds),
         bfs_visits,
         grown,

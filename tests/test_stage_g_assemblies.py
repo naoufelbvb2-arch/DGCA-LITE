@@ -14,6 +14,7 @@ from dgca_lite.model import (
     SynapseScope,
     SynapseState,
     Territory,
+    TickTransaction,
 )
 from dgca_lite.network import SparseNetwork
 
@@ -151,3 +152,85 @@ def test_form_frontier_fails_closed_instead_of_truncating() -> None:
         network.topology, config, 0,
     )
     assert result.formed == 0
+
+
+def test_maintain_exact_set_collision_keeps_minimum_assembly_id() -> None:
+    config = CoreConfig(
+        E_max=1,
+        local_radius=5,
+        specificity_radius=5,
+        assembly_radius=5,
+        K_min=3,
+        rho_keep=0.4,
+        sigma_keep=0.1,
+        theta_A=0.5,
+    )
+    network = make_network(config, (0, 1, 2, 3, 4))
+    for left, right in (
+        (0, 1),
+        (0, 2),
+        (1, 2),
+        (0, 3),
+        (1, 3),
+        (2, 3),
+        (0, 4),
+        (1, 4),
+        (2, 4),
+    ):
+        seed_reciprocal(network, left, right)
+    network.seed_assembly(Assembly(3, Territory.LANGUAGE, frozenset({0, 1, 2, 3})))
+    network.seed_assembly(Assembly(9, Territory.LANGUAGE, frozenset({0, 1, 2, 4})))
+    changed_pairs = {(member, extra) for extra in (3, 4) for member in (0, 1, 2)}
+    deletes = frozenset(
+        (source, target, SynapseScope.LOCAL)
+        for left, right in changed_pairs
+        for source, target in ((left, right), (right, left))
+    )
+    result = process_assemblies(
+        network.snapshot(),
+        {},
+        deletes,
+        changed_pairs,
+        network.topology,
+        config,
+        10,
+    )
+    assert result.upserts[3].members == frozenset({0, 1, 2})
+    assert 9 in result.deletes
+
+    transaction = TickTransaction(base_version=network.version)
+    transaction.synapse_deletes.update(deletes)
+    transaction.assembly_upserts.update(result.upserts)
+    transaction.assembly_deletes.update(result.deletes)
+    network.commit(transaction)
+    assert network.assemblies == {
+        3: Assembly(3, Territory.LANGUAGE, frozenset({0, 1, 2}))
+    }
+
+
+def test_grow_rejects_exact_set_owned_by_another_assembly() -> None:
+    config = CoreConfig(
+        E_max=1,
+        local_radius=5,
+        specificity_radius=5,
+        assembly_radius=5,
+        K_min=3,
+        rho_G=0.5,
+        sigma_G=0.3,
+        rho_keep=0.1,
+        sigma_keep=0.05,
+        theta_A=0.5,
+    )
+    network = make_network(config)
+    for left, right in ((0, 1), (0, 2), (1, 2), (3, 1), (3, 2)):
+        seed_reciprocal(network, left, right)
+    network.seed_assembly(Assembly(3, Territory.LANGUAGE, frozenset({0, 1, 2})))
+    network.seed_assembly(Assembly(9, Territory.LANGUAGE, frozenset({0, 1, 2, 3})))
+    upserts = {}
+    reciprocal(upserts, 0, 3)
+    result = process_assemblies(
+        network.snapshot(), upserts, frozenset(), {(0, 3)}, network.topology, config, 10
+    )
+    assert result.grown == 0
+    assert 3 not in result.upserts
+    assert result.deletes == frozenset()

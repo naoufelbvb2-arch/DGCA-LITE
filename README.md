@@ -1,7 +1,7 @@
-# DGCA LITE — Layer 1 Core v0.3
+# DGCA LITE — Layer 1 Core v0.4
 
 This repository contains the Layer 1 reference implementation governed solely by
-[`01_CORE_v0.3.md`](01_CORE_v0.3.md). Earlier Core documents are retained as project
+[`01_CORE_v0.4.md`](01_CORE_v0.4.md). Earlier Core documents are retained as project
 artifacts but are not implementation authorities.
 
 The package implements sparse logical topology, immutable tick snapshots, continuous
@@ -34,4 +34,3 @@ restored = CoreEngine.load("core-state.json")
 `TickResult` and its diagnostics are transient observations. Canonical learned state
 is limited to Cells, Synapses, and Assemblies; bounded temporal Surface provenance is
 persisted separately to preserve deterministic continuation.
-

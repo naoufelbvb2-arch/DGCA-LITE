@@ -1,6 +1,6 @@
-"""DGCA LITE Layer 1 Core v0.3.
+"""DGCA LITE Layer 1 Core v0.4.
 
-``01_CORE_v0.3.md`` is the sole architectural authority for this package.
+``01_CORE_v0.4.md`` is the sole architectural authority for this package.
 """
 
 from .config import CoreConfig

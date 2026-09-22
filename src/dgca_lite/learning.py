@@ -92,6 +92,7 @@ def enumerate_evidence(
 ) -> tuple[list[EvidenceProposal], int, int]:
     proposals: list[EvidenceProposal] = []
     frontier = activation.learning_frontier
+    events = tuple(temporal_events)
     local_inspected = 0
     associative_inspected = 0
 
@@ -105,7 +106,7 @@ def enumerate_evidence(
                 EvidenceProposal(root_id, source, target, SynapseScope.LOCAL, q, 1, True)
             )
 
-    for event in sorted(temporal_events, key=lambda item: item.tick):
+    for event in sorted(events, key=lambda item: item.tick):
         delta = snapshot.tick - event.tick
         kernel = temporal_kernel(delta, config)
         if delta < 1 or kernel == 0:
@@ -135,6 +136,50 @@ def enumerate_evidence(
             raise ValueError("evidence quality must be finite and in [0, 1]")
         if item.source_id == item.target_id:
             raise ValueError("self-Synapse evidence is forbidden")
+        if not item.external_origin:
+            continue
+        if item.scope is SynapseScope.LOCAL:
+            if item.source_id not in frontier or item.target_id not in frontier:
+                raise ValueError(
+                    "supplied LOCAL evidence endpoints must be in the learning-active frontier"
+                )
+            if item.target_id not in topology.neighborhood(
+                item.source_id, SynapseScope.LOCAL
+            ):
+                raise ValueError("supplied LOCAL evidence is outside the bounded workset")
+            maximum_q = (
+                activation.next_activation[item.source_id]
+                * activation.next_activation[item.target_id]
+            )
+        elif item.scope is SynapseScope.ASSOCIATIVE:
+            if item.target_id not in frontier:
+                raise ValueError(
+                    "supplied ASSOCIATIVE target must be in the learning-active frontier"
+                )
+            if item.target_id not in topology.neighborhood(
+                item.source_id, SynapseScope.ASSOCIATIVE
+            ):
+                raise ValueError(
+                    "supplied ASSOCIATIVE evidence is outside the bounded workset"
+                )
+            lawful_mass = [
+                historical_activation
+                * activation.next_activation[item.target_id]
+                * temporal_kernel(snapshot.tick - event.tick, config)
+                for event in events
+                if 1 <= snapshot.tick - event.tick <= config.temporal_horizon
+                for source, historical_activation in event.activations
+                if source == item.source_id
+            ]
+            if not lawful_mass:
+                raise ValueError(
+                    "supplied ASSOCIATIVE source lacks lawful bounded temporal provenance"
+                )
+            maximum_q = max(lawful_mass)
+        else:
+            raise ValueError("supplied CROSS_TERRITORY evidence is unavailable in Core v0.4")
+        if item.q > maximum_q + config.epsilon:
+            raise ValueError("supplied evidence mass exceeds its lawful activation bound")
         proposals.append(
             EvidenceProposal(
                 root_id,

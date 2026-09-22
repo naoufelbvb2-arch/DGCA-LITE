@@ -48,7 +48,7 @@ def _signature_from_dict(value: dict[str, Any]) -> SparseSignature:
 
 def engine_state(engine: CoreEngine) -> dict[str, Any]:
     return {
-        "format": "DGCA-LITE-Core-v0.3",
+        "format": "DGCA-LITE-Core-v0.4",
         "config": engine.config.to_dict(),
         "network": engine.network.canonical_state(),
         "temporal": {
@@ -83,7 +83,7 @@ def load_engine(path: str | Path) -> CoreEngine:
 
     with Path(path).open("r", encoding="utf-8") as handle:
         value = json.load(handle)
-    if value.get("format") != "DGCA-LITE-Core-v0.3":
+    if value.get("format") != "DGCA-LITE-Core-v0.4":
         raise ValueError("unsupported persistence format")
     engine = CoreEngine(CoreConfig.from_dict(value["config"]))
     network_state = value["network"]

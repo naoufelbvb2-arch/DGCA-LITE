@@ -287,12 +287,18 @@ def reclaimable_cells(
     config: CoreConfig,
     assembly_upserts: Mapping[int, Assembly] | None = None,
     assembly_deletes: frozenset[int] = frozenset(),
+    post_activation: Mapping[int, float] | None = None,
 ) -> frozenset[int]:
     assembly_upserts = assembly_upserts or {}
+    post_activation = post_activation or {}
     result: set[int] = set()
     for cell_id in sorted(set(candidate_ids)):
         cell = snapshot.cells.get(cell_id)
-        if cell is None or not cell.committed or cell.activation >= config.theta_active:
+        if (
+            cell is None
+            or not cell.committed
+            or post_activation.get(cell_id, cell.activation) >= config.theta_active
+        ):
             continue
         if cell_id in references or cell_id in reservations or cell_id in temporal_references:
             continue

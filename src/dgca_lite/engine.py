@@ -1,4 +1,4 @@
-"""Canonical external-event transaction orchestrator for Layer 1 Core v0.3."""
+"""Canonical external-event transaction orchestrator for Layer 1 Core v0.4."""
 
 from __future__ import annotations
 
@@ -96,12 +96,10 @@ class CoreEngine:
     @staticmethod
     def _references(
         receptor_drive: Mapping[int, float],
-        activation: ActivationResult,
         resources: ResourceResult,
         assemblies: AssemblyResult,
     ) -> frozenset[int]:
         references = set(receptor_drive)
-        references.update(activation.next_activation)
         for source, target, _ in resources.edge_upserts:
             references.update((source, target))
         for proposal in resources.blocked:
@@ -120,138 +118,140 @@ class CoreEngine:
         additional_evidence: Iterable[AdjudicatedEvidence] = (),
     ) -> TickResult:
         boundary_present = boundary.present if isinstance(boundary, HardBoundary) else boundary
-        root = self.temporal.begin()
-        try:
-            if boundary_present:
-                self.temporal.apply_boundary()
-            signature = self.surface.encode(event)
-            receptor_drive = dict(self.surface.receptor_drive(signature))
-            snapshot = self.network.snapshot()
-            context = self.temporal.events
-            novelty = compute_novelty(snapshot, receptor_drive, context, self.config)
-            activation = compute_activation(
-                snapshot, receptor_drive, self.config, boundary_reset=boundary_present
-            )
-            learning = learn_tick(
-                snapshot,
-                activation,
-                context,
-                self.network.topology,
-                self.config,
-                root.id,
-                additional=additional_evidence,
-            )
+        root_id = self.temporal.next_root_id
+        signature = self.surface.encode(event)
+        receptor_drive = dict(self.surface.receptor_drive(signature))
+        snapshot = self.network.snapshot()
+        context = () if boundary_present else self.temporal.events
+        novelty = compute_novelty(snapshot, receptor_drive, context, self.config)
+        activation = compute_activation(
+            snapshot, receptor_drive, self.config, boundary_reset=boundary_present
+        )
+        temporal_event = TemporalEvent(
+            tick=snapshot.tick,
+            activations=tuple(
+                (cell_id, activation.next_activation[cell_id])
+                for cell_id in sorted(activation.learning_frontier)
+            ),
+            signature=signature,
+            receptor_drive=tuple(sorted(receptor_drive.items())),
+        )
+        temporal_transaction = self.temporal.prospective(
+            temporal_event, boundary=boundary_present
+        )
+        learning = learn_tick(
+            snapshot,
+            activation,
+            context,
+            self.network.topology,
+            self.config,
+            root_id,
+            additional=additional_evidence,
+        )
 
-            # Expansion reserves are needed only for creation requests that budget
-            # arbitration actually blocks. Resolve once to discover them, then use
-            # the exact relevant mechanical current/historical receptor provenance.
-            provisional = resolve_resources(
-                snapshot, learning, receptor_drive, novelty.novelty, {}, self.config
-            )
-            reserves = self._expansion_reserves(
-                (proposal.key for proposal in provisional.blocked), receptor_drive, context
-            )
-            resources = resolve_resources(
-                snapshot,
-                learning,
-                receptor_drive,
-                novelty.novelty,
-                reserves,
-                self.config,
-            )
-            assemblies = process_assemblies(
-                snapshot,
-                resources.edge_upserts,
-                resources.edge_deletes,
-                resources.touched_pairs,
-                self.network.topology,
-                self.config,
-                self.network.next_assembly_id,
-            )
-            references = self._references(receptor_drive, activation, resources, assemblies)
-            reservations = frozenset(
-                item.cell_id
-                for item in resources.ordinary_recruitments
-                + resources.expansion_recruitments
-            )
-            reclaim_candidates = {
-                endpoint
-                for source, target, _ in resources.edge_deletes
-                for endpoint in (source, target)
-            }
-            reclaims = reclaimable_cells(
-                snapshot,
-                reclaim_candidates,
-                resources.edge_upserts,
-                resources.edge_deletes,
-                references,
-                reservations,
-                self.temporal.referenced_cells(),
-                self.config,
-                assemblies.upserts,
-                assemblies.deletes,
-            )
+        # Only historical provenance that survives the prospective append may
+        # supply expansion receptors.
+        provisional = resolve_resources(
+            snapshot, learning, receptor_drive, novelty.novelty, {}, self.config
+        )
+        reserves = self._expansion_reserves(
+            (proposal.key for proposal in provisional.blocked),
+            receptor_drive,
+            temporal_transaction.surviving_history,
+        )
+        resources = resolve_resources(
+            snapshot,
+            learning,
+            receptor_drive,
+            novelty.novelty,
+            reserves,
+            self.config,
+        )
+        assemblies = process_assemblies(
+            snapshot,
+            resources.edge_upserts,
+            resources.edge_deletes,
+            resources.touched_pairs,
+            self.network.topology,
+            self.config,
+            self.network.next_assembly_id,
+        )
+        references = self._references(receptor_drive, resources, assemblies)
+        reservations = frozenset(
+            item.cell_id
+            for item in resources.ordinary_recruitments
+            + resources.expansion_recruitments
+        )
+        reclaim_candidates = set(temporal_transaction.expired_references)
+        reclaim_candidates.update(assemblies.removed_members)
+        reclaim_candidates.update(
+            endpoint
+            for source, target, _ in resources.edge_deletes
+            for endpoint in (source, target)
+        )
+        reclaims = reclaimable_cells(
+            snapshot,
+            reclaim_candidates,
+            resources.edge_upserts,
+            resources.edge_deletes,
+            references,
+            reservations,
+            temporal_transaction.post_references,
+            self.config,
+            assemblies.upserts,
+            assemblies.deletes,
+            activation.next_activation,
+        )
 
-            transaction = TickTransaction(base_version=snapshot.version)
-            transaction.next_activation.update(activation.next_activation)
-            transaction.cell_commits.update(reservations)
-            transaction.cell_reclaims.update(reclaims)
-            transaction.synapse_upserts.update(resources.edge_upserts)
-            transaction.synapse_deletes.update(resources.edge_deletes)
-            transaction.assembly_upserts.update(assemblies.upserts)
-            transaction.assembly_deletes.update(assemblies.deletes)
-            transaction.touched_pairs.update(resources.touched_pairs)
-            transaction.references.update(references)
-            mutation_count = (
-                len(transaction.next_activation)
-                + len(transaction.cell_commits)
-                + len(transaction.cell_reclaims)
-                + len(transaction.synapse_upserts)
-                + len(transaction.synapse_deletes)
-                + len(transaction.assembly_upserts)
-                + len(transaction.assembly_deletes)
-            )
-            self.network.commit(transaction)
+        transaction = TickTransaction(base_version=snapshot.version)
+        transaction.next_activation.update(activation.next_activation)
+        transaction.cell_commits.update(reservations)
+        transaction.cell_reclaims.update(reclaims)
+        transaction.synapse_upserts.update(resources.edge_upserts)
+        transaction.synapse_deletes.update(resources.edge_deletes)
+        transaction.assembly_upserts.update(assemblies.upserts)
+        transaction.assembly_deletes.update(assemblies.deletes)
+        transaction.touched_pairs.update(resources.touched_pairs)
+        transaction.references.update(references)
+        mutation_count = (
+            len(transaction.next_activation)
+            + len(transaction.cell_commits)
+            + len(transaction.cell_reclaims)
+            + len(transaction.synapse_upserts)
+            + len(transaction.synapse_deletes)
+            + len(transaction.assembly_upserts)
+            + len(transaction.assembly_deletes)
+        )
+        self.temporal.validate(temporal_transaction)
+        self.network.commit(transaction)
+        self.temporal.publish(temporal_transaction)
 
-            temporal_event = TemporalEvent(
-                tick=snapshot.tick,
-                activations=tuple(
-                    (cell_id, activation.next_activation[cell_id])
-                    for cell_id in sorted(activation.learning_frontier)
-                ),
-                signature=signature,
-                receptor_drive=tuple(sorted(receptor_drive.items())),
-            )
-            self.temporal.finalize(temporal_event)
-            diagnostics = TickDiagnostics(
-                materialized_cells=self.network.materialized_cell_count,
-                active_frontier_size=len(activation.learning_frontier),
-                emission_frontier_size=len(activation.emission_frontier),
-                local_pairs_inspected=learning.local_pairs_inspected,
-                associative_pairs_inspected=learning.associative_pairs_inspected,
-                synaptic_proposals=learning.raw_proposal_count,
-                accepted_new_edges=resources.accepted_new_edges,
-                rejected_new_edges=resources.rejected_new_edges,
-                prunes=resources.prunes,
-                ordinary_recruitments=len(resources.ordinary_recruitments),
-                expansion_recruitments=len(resources.expansion_recruitments),
-                assembly_seeds=assemblies.assembly_seeds,
-                bfs_visits=assemblies.bfs_visits,
-                transaction_mutations=mutation_count,
-            )
-            return TickResult(
-                root.id,
-                snapshot.tick,
-                novelty,
-                activation,
-                learning,
-                resources,
-                assemblies,
-                diagnostics,
-            )
-        except Exception:
-            self.temporal.abort()
-            raise
+        diagnostics = TickDiagnostics(
+            materialized_cells=self.network.materialized_cell_count,
+            active_frontier_size=len(activation.learning_frontier),
+            emission_frontier_size=len(activation.emission_frontier),
+            local_pairs_inspected=learning.local_pairs_inspected,
+            associative_pairs_inspected=learning.associative_pairs_inspected,
+            synaptic_proposals=learning.raw_proposal_count,
+            accepted_new_edges=resources.accepted_new_edges,
+            rejected_new_edges=resources.rejected_new_edges,
+            prunes=resources.prunes,
+            ordinary_recruitments=len(resources.ordinary_recruitments),
+            expansion_recruitments=len(resources.expansion_recruitments),
+            assembly_seeds=assemblies.assembly_seeds,
+            bfs_visits=assemblies.bfs_visits,
+            transaction_mutations=mutation_count,
+        )
+        return TickResult(
+            root_id,
+            snapshot.tick,
+            novelty,
+            activation,
+            learning,
+            resources,
+            assemblies,
+            diagnostics,
+        )
 
     def process_text(
         self, text: str, *, boundary: bool = False

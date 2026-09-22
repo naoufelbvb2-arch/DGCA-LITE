@@ -39,6 +39,19 @@ def test_config_relationships() -> None:
         CoreConfig(rho_G=0.2, rho_keep=0.2)
     with pytest.raises(ValueError):
         CoreConfig(K_min=5, K_max=4)
+    with pytest.raises(ValueError):
+        CoreConfig(temporal_horizon=0)
+
+
+def test_projection_fanout_cannot_exceed_language_capacity() -> None:
+    assert CoreConfig(logical_capacity=3, receptor_fanout=1).receptor_fanout == 1
+    with pytest.raises(
+        ValueError, match="exceeds addressable LANGUAGE receptor capacity"
+    ):
+        CoreConfig(logical_capacity=3, receptor_fanout=2)
+    assert CoreConfig(logical_capacity=4, receptor_fanout=2).receptor_fanout == 2
+    with pytest.raises(ValueError):
+        CoreConfig(logical_capacity=4, receptor_fanout=3)
 
 
 def test_self_synapse_rejected() -> None:

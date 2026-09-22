@@ -186,6 +186,7 @@ class TickSnapshot:
     outgoing: Mapping[int, Mapping[tuple[int, SynapseScope], Synapse]]
     incoming: Mapping[int, frozenset[tuple[int, SynapseScope]]]
     assemblies: Mapping[int, Assembly]
+    assembly_index: Mapping[frozenset[int], int]
     memberships: Mapping[int, frozenset[int]]
     active_ids: frozenset[int]
 

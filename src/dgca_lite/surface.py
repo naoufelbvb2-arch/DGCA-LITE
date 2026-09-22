@@ -76,13 +76,16 @@ class SurfaceCodec:
                 receptors.append(neighbor)
             if len(receptors) >= self.config.receptor_fanout:
                 return tuple(receptors)
-        salt = 1
-        while len(receptors) < self.config.receptor_fanout:
-            candidate = start + self._feature_digest(feature, salt) % size
+        # A bounded deterministic linear permutation completes the projection.
+        # Configuration validation guarantees the requested unique count fits.
+        fallback_start = self._feature_digest(feature, 1) % size
+        for offset in range(size):
+            candidate = start + (fallback_start + offset) % size
             if candidate not in receptors:
                 receptors.append(candidate)
-            salt += 1
-        return tuple(receptors)
+            if len(receptors) >= self.config.receptor_fanout:
+                return tuple(receptors)
+        raise AssertionError("validated receptor capacity must satisfy projection")
 
     @staticmethod
     def _local_scope():
@@ -107,4 +110,3 @@ class SurfaceCodec:
                 remaining *= 1.0 - weight
             result.append((receptor, 1.0 - remaining))
         return tuple(result)
-

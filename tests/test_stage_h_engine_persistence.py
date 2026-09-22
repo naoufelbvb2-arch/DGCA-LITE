@@ -34,16 +34,16 @@ def test_external_evidence_flows_through_candidate_creation() -> None:
     engine = CoreEngine(config)
     source = 0
     target = engine.network.topology.neighborhood(source, SynapseScope.LOCAL)[0]
-    engine.network.seed_cell(Cell(source, Territory.LANGUAGE, True, 0, 4))
-    engine.network.seed_cell(Cell(target, Territory.LANGUAGE, True, 0, 4))
+    engine.network.seed_cell(Cell(source, Territory.LANGUAGE, True, 0.8, 4))
+    engine.network.seed_cell(Cell(target, Territory.LANGUAGE, True, 0.8, 4))
     result = engine.process_event(
         SurfaceEvent.from_text("evidence"),
         additional_evidence=(
-            AdjudicatedEvidence(source, target, SynapseScope.LOCAL, 1.0, 1),
+            AdjudicatedEvidence(source, target, SynapseScope.LOCAL, 0.3, 1),
         ),
     )
     edge = engine.network.edge(source, target, SynapseScope.LOCAL)
-    assert result.diagnostics.accepted_new_edges == 1
+    assert result.diagnostics.accepted_new_edges == 2
     assert edge is not None and edge.state.value == "CANDIDATE"
 
 
@@ -90,7 +90,7 @@ def test_persistence_round_trip_and_continued_replay(tmp_path) -> None:
     engine.save(path)
     restored = CoreEngine.load(path)
     assert engine_state(restored) == engine_state(engine)
-    assert json.loads(path.read_text(encoding="utf-8"))["format"] == "DGCA-LITE-Core-v0.3"
+    assert json.loads(path.read_text(encoding="utf-8"))["format"] == "DGCA-LITE-Core-v0.4"
     engine.process_event(SurfaceEvent.from_text("continue"))
     restored.process_event(SurfaceEvent.from_text("continue"))
     assert engine_state(restored) == engine_state(engine)
