@@ -1914,40 +1914,65 @@ S'<\theta_{demote}
 
 A newly created Synapse remains Candidate throughout its creation tick.
 
-## Appendix C — Layer 1 Closure Manifest Template
+## Appendix C — Layer 1 Closure Manifest
 
-The following block is intentionally unfilled until implementation is complete.
-
-```text
+```yaml
 Specification:
   DGCA LITE Layer 1 Core v0.4
 
-Implementation repository:
-  PENDING
+Specification SHA-256:
+  5324d423b341b1f17da1cc0c53e59cfb59c7724b0f9ed19b323fb4bee5e3b2b7
 
-Implementation commit:
-  PENDING
+Implementation repository:
+  https://github.com/naoufelbvb2-arch/DGCA-LITE.git
+
+Reviewed implementation commit:
+  beb10058b09f44e8a1ed737dca81db4d1091473e
+
+Parent implementation commit:
+  75d5e9eb8f10009d85762291eb9c593bd67c9bee
+
+Package:
+  dgca-lite 0.4.0
 
 Reference configuration:
-  PENDING
+  CoreConfig defaults at reviewed implementation commit
+  logical_capacity = 1,000,000
+  Python >= 3.12
 
 Test manifest:
-  PENDING
+  Full pytest: 91 passed
+  Deterministic replay verification: 2 passed
+  Ruff: All checks passed
+  Distribution wheel: built successfully
+
+Promoted verification:
+  pytest: 91 passed in 10.83s
+  deterministic replay: 2 passed in 1.27s
+  wheel SHA-256:
+  0b9464d526e9edf3d24e8d71bf4b02d889bdeab7d7506c4be8a1024730b4f727
 
 Acceptance result:
-  PENDING
+  PASS
 
 Architecture review:
-  PENDING
+  R01_INDEPENDENT_REVIEW_PASS
+  No remaining architectural drift found
+  No Layer 2+ functionality present
 
 Known limitations:
-  PENDING
+  Numerical calibration parameters remain experimental as explicitly permitted by v0.4.
+  Current production focus is LANGUAGE; Audio/Vision integration remains deferred.
+  CROSS_TERRITORY learning origination is not enabled in Layer 1 language-only operation.
+  Layer 2 Memory/Retrieval and all higher cognitive layers are intentionally absent.
+  Verification is repository/local-test based; no GitHub CI status check is currently configured.
+  Wheel archive SHA may vary between builds unless reproducible-build tooling is introduced; this does not alter canonical implementation state.
 
 Final frozen specification version:
-  PENDING
+  DGCA LITE Layer 1 Core v0.4
 
 Status:
-  V0.4 CONFORMANCE REPAIR PENDING
+  FROZEN
 ```
 
 ---

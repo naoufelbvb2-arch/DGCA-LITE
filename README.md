@@ -11,6 +11,14 @@ event-driven Assembly MAINTAIN → GROW → FORM, atomic commit, deterministic J
 persistence, and transient diagnostics. It does not implement Layer 2 or later
 memory, cognition, reasoning, or generation behavior.
 
+## Closure status
+
+```yaml
+Layer 1 Core v0.4: FROZEN
+Reviewed implementation commit:
+beb10058b09f44e8a1ed737dca81db4d1091473e
+```
+
 ## Requirements and verification
 
 Python 3.12 or newer is required. The runtime package has no third-party dependencies;
