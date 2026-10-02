@@ -1,0 +1,35 @@
+"""Closed semantic families and the exact Section 102 exemption allowlist.
+
+These declarations do not dispatch work or grant exemptions to helper calls.
+Identity validation and serialization must run inside a charged parent envelope
+when used by cognition.
+"""
+
+from enum import Enum
+
+
+class InferenceFamily(Enum):
+    GROUND_MODUS_PONENS = "GROUND_MODUS_PONENS"
+    TRANSITIVE_COMPOSITION = "TRANSITIVE_COMPOSITION"
+
+
+class ConstraintFamily(Enum):
+    GROUND_NEGATION_CONFLICT = "GROUND_NEGATION_CONFLICT"
+    EXPLICIT_MUTUAL_EXCLUSION = "EXPLICIT_MUTUAL_EXCLUSION"
+    SINGLE_VALUED_SLOT_CONFLICT = "SINGLE_VALUED_SLOT_CONFLICT"
+
+
+class ControlPlaneOperation(Enum):
+    READ_IMMUTABLE_LIFECYCLE_FLAG = "READ_IMMUTABLE_LIFECYCLE_FLAG"
+    RETIRE_UNUSED_CHARGE_UNITS = "RETIRE_UNUSED_CHARGE_UNITS"
+    RELEASE_TERMINAL_REGISTRY_CAPACITY = "RELEASE_TERMINAL_REGISTRY_CAPACITY"
+    ATTACH_ALREADY_PRODUCED_DESCRIPTOR = "ATTACH_ALREADY_PRODUCED_DESCRIPTOR"
+    CANONICAL_COMPARE_WITHIN_ALREADY_CHARGED_PARENT_WORK = (
+        "CANONICAL_COMPARE_WITHIN_ALREADY_CHARGED_PARENT_WORK"
+    )
+    AUTHORITY_REDUCING_LIFECYCLE_BOOKKEEPING = (
+        "AUTHORITY_REDUCING_LIFECYCLE_BOOKKEEPING"
+    )
+
+
+CONTROL_PLANE_ALLOWLIST = frozenset(ControlPlaneOperation)
