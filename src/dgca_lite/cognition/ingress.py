@@ -44,6 +44,7 @@ from .identity import (
     CanonicalDescriptor,
     ClaimContentID,
     DependencyRootIdentity,
+    InvocationCauseID,
     ScopeIdentity,
     SourceAssertionKey,
     _validated_record_fields,
@@ -399,6 +400,39 @@ def _build_authority_system():
                 )
                 return ActiveConstraintPremiseView(*image.values)
 
+    class InvocationCauseIngress(_OpaqueHandle):
+        """Narrow bootstrap/admission handle; exposes no source-issuance methods."""
+
+        __slots__ = ()
+
+    @contextmanager
+    def pinned_invocation_cause(ingress: object, capability: object = None):
+        """Private Unit-3 bridge: keep genuine issuance current through admission.
+
+        The returned identities are data, not admission capabilities. Unit 3
+        invokes this guard itself; it accepts neither these identities nor
+        caller-provided validator callbacks as proof. No issuer/Core reference
+        crosses the bridge, and the Core barrier remains held through the yield.
+        None is used only by trusted runtime bootstrap, never cause admission.
+        """
+        with pinned_adapter(ingress, "INVOCATION_CAUSE") as state:
+            cause = None
+            if capability is not None:
+                record = record_for(
+                    state,
+                    capability,
+                    (
+                        ExternalOccurrenceCapability,
+                        FormalSourceOccurrenceCapability,
+                        AssumptionIssuanceCapability,
+                        FormalConstraintOccurrenceCapability,
+                    ),
+                )
+                cause = _snapshot(
+                    InvocationCauseID(record.source_authority, record.occurrence)
+                )
+            yield _snapshot(state.runtime), cause
+
     def remove_domain(state: _State) -> None:
         state.closed = True
         state.revision += 1
@@ -446,6 +480,13 @@ def _build_authority_system():
             with state.barrier:
                 live(state)
                 return state.adapters[2]
+
+        @property
+        def invocation_causes(self) -> InvocationCauseIngress:
+            state = state_for(self, "ISSUER")
+            with state.barrier:
+                live(state)
+                return state.adapters[3]
 
         @contextmanager
         def core_transition(self):
@@ -698,6 +739,7 @@ def _build_authority_system():
                     FormalReasoningIngress,
                     FormalConstraintIngress,
                     TrustedObservationAdapter,
+                    InvocationCauseIngress,
                 )
             )
 
@@ -714,7 +756,9 @@ def _build_authority_system():
             next_domains[id(owner)] = (owner_ref, state)
             next_handles[id(owner)] = (owner_ref, state, "ISSUER", TrustedIngressIssuer)
             for adapter, role in zip(
-                state.adapters, ("REASONING", "CONSTRAINT", "OBSERVATION"), strict=True
+                state.adapters,
+                ("REASONING", "CONSTRAINT", "OBSERVATION", "INVOCATION_CAUSE"),
+                strict=True,
             ):
                 next_handles[id(adapter)] = (ref(adapter), state, role, type(adapter))
             next_runtime_ids.add(runtime_key)
@@ -732,6 +776,8 @@ def _build_authority_system():
         FormalConstraintIngress,
         TrustedObservationAdapter,
         create_trusted_ingress_boundary,
+        InvocationCauseIngress,
+        pinned_invocation_cause,
     )
 
 
@@ -741,5 +787,7 @@ def _build_authority_system():
     FormalConstraintIngress,
     TrustedObservationAdapter,
     create_trusted_ingress_boundary,
+    InvocationCauseIngress,
+    _pinned_invocation_cause,
 ) = _build_authority_system()
 del _build_authority_system
