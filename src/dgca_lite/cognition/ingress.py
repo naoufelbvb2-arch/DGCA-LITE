@@ -16,7 +16,7 @@ invocation integration must supply its canonical owner/charge contracts.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from threading import RLock
 from weakref import ReferenceType, ref
 
@@ -43,6 +43,7 @@ from .identity import (
     AssertionSemanticKey,
     CanonicalDescriptor,
     ClaimContentID,
+    CoreStateBinding,
     DependencyRootIdentity,
     InvocationCauseID,
     ScopeIdentity,
@@ -433,6 +434,45 @@ def _build_authority_system():
                 )
             yield _snapshot(state.runtime), cause
 
+    @contextmanager
+    def pinned_core_binding(ingress: object):
+        """Unit-4 capture under the SAME complete Core transition barrier.
+
+        Only closed binding data crosses this bridge, never Core or its issuer.
+        The trusted composition root must route every external transition through
+        core_transition, as required by the existing Unit-2 integration contract.
+        """
+        from dgca_lite.config import CoreConfig
+
+        with pinned_adapter(ingress, "INVOCATION_CAUSE") as state:
+            core = state.core
+            if type(core.config) is not CoreConfig:
+                raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
+            try:
+                values = {
+                    f.name: getattr(core.config, f.name) for f in fields(CoreConfig)
+                }
+                frozen_config = CoreConfig(**values)
+                policy = CanonicalDescriptor(
+                    "CoreConfig",
+                    tuple(
+                        (f.name, getattr(frozen_config, f.name))
+                        for f in fields(CoreConfig)
+                    ),
+                )
+                binding = _snapshot(
+                    CoreStateBinding(
+                        state.runtime,
+                        core.network.version,
+                        core.network.tick,
+                        core.temporal.next_root_id,
+                        policy,
+                    )
+                )
+            except (TypeError, ValueError, AttributeError) as error:
+                raise IngressAbort(FailureCode.INVALID_POLICY_BINDING) from error
+            yield binding
+
     def remove_domain(state: _State) -> None:
         state.closed = True
         state.revision += 1
@@ -778,6 +818,7 @@ def _build_authority_system():
         create_trusted_ingress_boundary,
         InvocationCauseIngress,
         pinned_invocation_cause,
+        pinned_core_binding,
     )
 
 
@@ -789,5 +830,6 @@ def _build_authority_system():
     create_trusted_ingress_boundary,
     InvocationCauseIngress,
     _pinned_invocation_cause,
+    _pinned_core_binding,
 ) = _build_authority_system()
 del _build_authority_system

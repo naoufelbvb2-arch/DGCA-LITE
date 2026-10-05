@@ -25,7 +25,12 @@ from weakref import ReferenceType, ref
 from .authority import IngressAbort, _OpaqueHandle
 from .budget import BudgetChargeView, BudgetLedgerView, BudgetReservation
 from .identity import CanonicalDescriptor, InvocationCauseID
-from .ingress import InvocationCauseIngress, _pinned_invocation_cause, _snapshot
+from .ingress import (
+    InvocationCauseIngress,
+    _pinned_core_binding,
+    _pinned_invocation_cause,
+    _snapshot,
+)
 from .serialization import canonical_identity_bytes
 from .types import FailureCode, InvocationState
 
@@ -152,6 +157,8 @@ def _build_invocation_system():
         # Future nondelegated owners must register within active_guard. Unit 3
         # creates none. Finalization already requires their count to be zero.
         nondelegated_children: int = 0
+        cie_child: object = None
+        cie_sequence: int = 0
 
     @dataclass(slots=True)
     class _Domain:
@@ -164,6 +171,7 @@ def _build_invocation_system():
         owner_ref: object = None
         owner_id: int = 0
         retired: bool = False
+        cie_attached: bool = False
 
     @contextmanager
     def access(handle: object, role: str):
@@ -593,6 +601,10 @@ def _build_invocation_system():
                         InvocationState.CLOSING,
                     )
                     item.lifecycle = (InvocationState.CLOSING, revision + 1)
+                    if item.cie_child is not None:
+                        # Fixed private Unit-4 child, not a caller callback. No
+                        # asynchronous drain/wait occurs under this barrier.
+                        item.cie_child.parent_close()
                     return output
                 return view(domain, item)
 
@@ -659,6 +671,8 @@ def _build_invocation_system():
                                 item.lifecycle[1] + 1,
                             )
                         if item.lifecycle[0] is InvocationState.CLOSING:
+                            if item.cie_child is not None:
+                                item.cie_child.parent_close()
                             retire_unused(item)
                             item.lifecycle = (
                                 InvocationState.CLOSED,
@@ -690,10 +704,53 @@ def _build_invocation_system():
                 handles, used_runtimes = staged_handles, staged_used
                 return owner
 
-    return InvocationRuntime, InvocationBudgetLedger, create_invocation_runtime
+    @contextmanager
+    def pinned_cie_parent(
+        runtime: object,
+        authority: object = None,
+        revision: int | None = None,
+        *,
+        core: bool = False,
+    ):
+        """Private Unit-4 integration; never accepts caller validation callbacks.
+
+        Holds existing barriers in Core -> lifecycle order, pins the genuine
+        invocation runtime and exposes private owner state only to CIE runtime.
+        """
+        if core:
+            before_core_guard()
+        with access(runtime, "RUNTIME") as (domain, _):
+
+            @contextmanager
+            def binding_guard():
+                if core:
+                    with _pinned_core_binding(domain.ingress) as binding:
+                        yield binding
+                else:
+                    yield None
+
+            with binding_guard() as binding, domain.lifecycle:
+                live(domain)
+                item = None
+                if authority is not None:
+                    with registry_lock:
+                        item = invocation_for(domain, authority)
+                    if revision is not None:
+                        current(item, revision, active=True)
+                yield domain, item, binding
+
+    return (
+        InvocationRuntime,
+        InvocationBudgetLedger,
+        create_invocation_runtime,
+        pinned_cie_parent,
+    )
 
 
-InvocationRuntime, InvocationBudgetLedger, create_invocation_runtime = (
-    _build_invocation_system()
-)
+(
+    InvocationRuntime,
+    InvocationBudgetLedger,
+    create_invocation_runtime,
+    _pinned_cie_parent,
+) = _build_invocation_system()
 del _build_invocation_system
