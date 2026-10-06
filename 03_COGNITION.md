@@ -1158,6 +1158,37 @@ An internally reconstructed Cell alone cannot match an atomic carrier.
 
 Prediction does not rank multiple forecast targets by global confidence.
 
+## 32.1 Future Reconstruction Lane Binding
+
+A sealed `BranchPattern` is constructed from a source-specific associative target branch at prediction/origin time, but its future reinstatement is evaluated only through the exact target Assembly's root-seeded `SourceView`.
+
+For a sealed `T = BranchPattern(source_identity=x, target_assembly_id=g, anchor_carriers=A_T, pattern_cells=P_T)` and one lawful successful future trusted Layer-2 retrieval result `R_o`, select the unique source view, if it exists:
+
+```text
+S_o(g) = SourceView in R_o.sources
+         where SourceView.source_id == ("ASM", g)
+
+W_o(T) = set(S_o(g).root_authorized_witnesses)
+V_o(T) = set(S_o(g).reconstructed_cells)
+```
+
+Both `W_o(T)` and `V_o(T)` in the unchanged §32 matching equations come from this exact root-seeded `SourceView("ASM", g)`.
+
+If the target Assembly remains valid under `TargetGuard` but no exact `SourceView("ASM", g)` exists in the successful future retrieval, define `W_o(T) = empty` and `V_o(T) = empty`. This is a lawful nonmatch, not `TARGET_STALE`. Target staleness remains reserved for failure of the sealed target identity / `TargetGuard`, not absence of future target activation.
+
+Associative `BranchViews` are excluded from both `PatternReinstated` and `AnchorConfirmed`. No `BranchView` may contribute Cells to `V_o(T)`, including the branch with the exact sealed source and target, a branch from another source, or any union of branches. There is no branch fallback, branch selection, cross-source aggregation, or `SourceView`/`BranchView` merging.
+
+The sealed `source_identity=x` remains part of the target/commitment identity and guards the origin of the prediction. It does not select the future reconstruction lane. Associative `BranchView` reconstruction is authority-free internal retrieval and cannot increase future forecast-match evidence.
+
+```text
+OriginPredictionLane != FutureObservationLane
+FutureAssociativeReconstruction != FutureTargetObservationReinstatement
+PredictionGenerationBranch != PredictionVerificationLane
+SourceLane != TargetBranchLane
+```
+
+These distinctions hold even when both lanes refer to the same Assembly. For target Assembly `7`, source `("ATOM",5)`, anchors `{3,9}`, and sealed pattern `{3,4,9}`, a future exact Assembly `SourceView` with witnesses and reconstructed Cells `{3,9}` produces `AnchorConfirmed = True`, `PatternReinstated = False`, and `BranchMatched = False`, even if the exact source-specific `BranchView` reconstructs `{3,4,9}`. That branch is ignored. At the final horizon offset, absent another terminal condition, this is a lawful covered nonmatch and §33.2 determines window closure.
+
 ---
 
 # 33. Forecast Status Algebra
@@ -3502,6 +3533,12 @@ The implementation must prove at least:
 - complete exact sealed pattern reinstatement together with lawful anchor confirmation is matched, without a score or partial-pattern threshold;
 - complete pattern reinstatement without lawful anchor confirmation is not matched;
 - combining witnesses or reconstructed Cells from different target Assemblies cannot produce a branch match;
+- exact future root-seeded Assembly `SourceView` lane is used for `BranchPattern` reinstatement;
+- an exact matching `BranchView` cannot complete an otherwise incomplete target `SourceView`;
+- `BranchViews` from other sources cannot contribute to future match evaluation;
+- branch union cannot contribute to future match evaluation;
+- absent target `SourceView` with valid `TargetGuard` is a lawful nonmatch, not `TARGET_STALE`;
+- future associative reconstruction cannot self-confirm a forecast;
 - atomic direct hits remain distinct from branch targets;
 - an atomic carrier reconstructed internally but absent from genuine future root-authorized witnesses is not matched;
 - no backdating;
