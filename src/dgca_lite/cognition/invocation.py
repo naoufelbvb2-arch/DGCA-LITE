@@ -161,6 +161,7 @@ def _build_invocation_system():
         cie_child: object = None
         cie_sequence: int = 0
         work_owner: object = None
+        effect_owner: object = None
 
     @dataclass(slots=True)
     class _Domain:
@@ -175,6 +176,7 @@ def _build_invocation_system():
         retired: bool = False
         cie_attached: bool = False
         work_attached: bool = False
+        effect_attached: bool = False
 
     @contextmanager
     def access(handle: object, role: str):
@@ -357,6 +359,37 @@ def _build_invocation_system():
         staged = list(units)
         staged[index] = _Unit("CONSUMED", units[index].reservation)
         return output, (tuple(staged), records, sequence)
+
+    def inspect_charge(item, reservation, unit_index, work_class):
+        """Genuine historical accounting binding, never a usable charge/permit.
+
+        Used by exact effect retry lookup under lifecycle + ledger. State is
+        deliberately not promoted to RESERVED; consumed/retired stays terminal.
+        """
+        record = reservation_for(item, reservation)
+        index = unit_ordinal(unit_index, len(item.budget.index[0]))
+        if index not in record.units:
+            raise IngressAbort(FailureCode.MISSING_BUDGET_CHARGE)
+        if type(work_class) is not CanonicalDescriptor or canonical_identity_bytes(
+            work_class
+        ) != canonical_identity_bytes(record.work_class):
+            raise IngressAbort(FailureCode.BUDGET_WORKCLASS_MISMATCH)
+        if item.budget.index[0][index].reservation != record.identity:
+            raise IngressAbort(FailureCode.MISSING_BUDGET_CHARGE)
+        data = _snapshot(
+            CanonicalDescriptor(
+                "ChargeFields",
+                (
+                    item.identity,
+                    record.identity,
+                    CanonicalDescriptor(
+                        "InvocationChargeUnitIdentity", (record.identity, index)
+                    ),
+                    record.work_class,
+                ),
+            )
+        )
+        return BudgetChargeView(*data.values)
 
     def retire_unused(item: _Invocation) -> None:
         units, records, sequence = item.budget.index
@@ -615,6 +648,8 @@ def _build_invocation_system():
                         item.cie_child.parent_close()
                     if item.work_owner is not None:
                         item.work_owner.parent_close()
+                    if item.effect_owner is not None:
+                        item.effect_owner.parent_close()
                     return output
                 return view(domain, item)
 
@@ -686,6 +721,8 @@ def _build_invocation_system():
                                 item.cie_child.parent_close()
                             if item.work_owner is not None:
                                 item.work_owner.parent_close()
+                            if item.effect_owner is not None:
+                                item.effect_owner.parent_close()
                             retire_unused(item)
                             item.lifecycle = (
                                 InvocationState.CLOSED,
@@ -772,6 +809,18 @@ def _build_invocation_system():
             with item.budget.lock:
                 yield domain, item, binding
 
+    @contextmanager
+    def pinned_effect_budget(runtime, authority, ledger, *, core=False):
+        # Allows historical lookup after close, never reactivates an owner.
+        with (
+            pinned_cie_parent(runtime, authority, core=core) as (domain, item, binding),
+            access(ledger, "LEDGER") as (own, registered),
+        ):
+            if own is not domain or registered is not item or item.ledger is not ledger:
+                raise IngressAbort(FailureCode.AMBIGUOUS_BUDGET_OWNER)
+            with item.budget.lock:
+                yield domain, item, binding
+
     return (
         InvocationRuntime,
         InvocationBudgetLedger,
@@ -780,6 +829,8 @@ def _build_invocation_system():
         pinned_work_budget,
         prepare_reservation,
         prepare_consumption,
+        pinned_effect_budget,
+        inspect_charge,
     )
 
 
@@ -791,5 +842,7 @@ def _build_invocation_system():
     _pinned_work_budget,
     _prepare_reservation,
     _prepare_consumption,
+    _pinned_effect_budget,
+    _inspect_charge,
 ) = _build_invocation_system()
 del _build_invocation_system

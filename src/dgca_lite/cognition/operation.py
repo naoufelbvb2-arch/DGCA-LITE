@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .budget import BudgetChargeView
+from .effect_types import _MechanicalEffectOperation
 from .identity import CanonicalDescriptor, SnapshotBinding
 from .ingress import _snapshot
 from .policy import ValueLimits
@@ -40,6 +41,7 @@ _MEMBERS = tuple(
     (cls, tuple((item, item.value) for item in cls))
     for cls in (
         OperationType,
+        _MechanicalEffectOperation,
         BudgetClass,
         AuthorityRequirement,
         PublicationPolicy,
@@ -125,7 +127,7 @@ class ResourceEnvelope:
 
 @dataclass(frozen=True, slots=True)
 class OperationContract:
-    operation_type: OperationType
+    operation_type: OperationType | _MechanicalEffectOperation
     budget_class: BudgetClass
     effect_class: WorkEffectClass
     authority_requirements: tuple[AuthorityRequirement, ...]
@@ -149,7 +151,12 @@ class OperationContract:
         return CanonicalDescriptor(
             "OperationContract",
             (
-                _label(self.operation_type, OperationType),
+                _label(
+                    self.operation_type,
+                    _MechanicalEffectOperation
+                    if type(self.operation_type) is _MechanicalEffectOperation
+                    else OperationType,
+                ),
                 _label(self.budget_class, BudgetClass),
                 _label(self.effect_class, WorkEffectClass),
                 labels,

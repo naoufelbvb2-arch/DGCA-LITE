@@ -74,6 +74,7 @@ def _build_cie_system():
         retired: bool = False
         opened: bool = False
         work_attached: bool = False
+        effect_attached: bool = False
 
     @dataclass(slots=True)
     class _Epoch:
@@ -576,10 +577,30 @@ def _build_cie_system():
                     raise CIEAbort(FailureCode.CIE_STALE)
                 yield
 
-    return CIERuntime, create_cie_runtime, pinned_work_policy, pinned_cie_work
+    @contextmanager
+    def pinned_effect_context(handle, parent, *, bootstrap=False):
+        # No Arena/lifecycle acquisition. Caller holds the genuine parent gate.
+        with access(handle, "RUNTIME") as (runtime, _):
+            if runtime.parent is not parent:
+                raise CIEAbort(FailureCode.INVALID_POLICY_BINDING)
+            if bootstrap and (runtime.opened or runtime.effect_attached):
+                raise CIEAbort(FailureCode.INVALID_POLICY_BINDING)
+            yield runtime
+
+    return (
+        CIERuntime,
+        create_cie_runtime,
+        pinned_work_policy,
+        pinned_cie_work,
+        pinned_effect_context,
+    )
 
 
-CIERuntime, create_cie_runtime, _pinned_work_policy, _pinned_cie_work = (
-    _build_cie_system()
-)
+(
+    CIERuntime,
+    create_cie_runtime,
+    _pinned_work_policy,
+    _pinned_cie_work,
+    _pinned_effect_context,
+) = _build_cie_system()
 del _build_cie_system
