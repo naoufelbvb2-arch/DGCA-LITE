@@ -31,6 +31,7 @@ from .ingress import (
     _pinned_invocation_cause,
     _snapshot,
 )
+from .locks import RankedBarrier, _deferred_cleanup
 from .serialization import canonical_identity_bytes
 from .types import FailureCode, InvocationState
 
@@ -105,7 +106,7 @@ def _build_invocation_system():
 
     class _LifecycleBarrier:
         def __init__(self):
-            self.lock = RLock()
+            self.lock = RankedBarrier(1)
 
         def __enter__(self):
             self.lock.acquire()
@@ -141,7 +142,7 @@ def _build_invocation_system():
 
     @dataclass(slots=True)
     class _Budget:
-        lock: object = field(default_factory=RLock)
+        lock: object = field(default_factory=lambda: RankedBarrier(2))
         # One publication swaps units, reservation records and the next sequence.
         index: tuple = field(default_factory=lambda: ((), {}, 0))
 
@@ -159,6 +160,7 @@ def _build_invocation_system():
         nondelegated_children: int = 0
         cie_child: object = None
         cie_sequence: int = 0
+        work_owner: object = None
 
     @dataclass(slots=True)
     class _Domain:
@@ -172,6 +174,7 @@ def _build_invocation_system():
         owner_id: int = 0
         retired: bool = False
         cie_attached: bool = False
+        work_attached: bool = False
 
     @contextmanager
     def access(handle: object, role: str):
@@ -275,6 +278,86 @@ def _build_invocation_system():
             raise IngressAbort(FailureCode.INVALID_INPUT)
         return value
 
+    def prepare_reservation(item, required_units, work_class):
+        """Build a prospective index only. Caller owns lifecycle and ledger."""
+        if type(required_units) is not int or required_units <= 0:
+            raise IngressAbort(FailureCode.INVALID_INPUT)
+        if type(work_class) is not CanonicalDescriptor:
+            raise IngressAbort(FailureCode.INVALID_INPUT)
+        units, records, sequence = item.budget.index
+        if required_units > len(units):
+            raise IngressAbort(FailureCode.BUDGET_ABORT)
+        available = tuple(
+            i for i, unit in enumerate(units) if unit.state == "AVAILABLE"
+        )
+        if required_units > len(available):
+            raise IngressAbort(FailureCode.BUDGET_ABORT)
+        chosen = available[:required_units]
+        try:
+            work = _snapshot(work_class)
+            identity = CanonicalDescriptor(
+                "InvocationReservationIdentity", (item.identity, sequence, work)
+            )
+            image = canonical_identity_bytes(
+                CanonicalDescriptor("ReservationFields", (identity, chosen, work))
+            )
+        except (TypeError, ValueError) as error:
+            raise IngressAbort(FailureCode.INVALID_INPUT) from error
+        try:
+            BudgetChargeView(
+                item.identity,
+                identity,
+                CanonicalDescriptor(
+                    "InvocationChargeUnitIdentity", (identity, chosen[-1])
+                ),
+                work,
+            )
+        except ValueError as error:
+            raise IngressAbort(FailureCode.CAPACITY_ABORT) from error
+        token = object.__new__(BudgetReservation)
+        record = _Reservation(token, identity, chosen, work, image)
+        staged_units = list(units)
+        for index in chosen:
+            staged_units[index] = _Unit("RESERVED", identity)
+        staged_records = dict(records)
+        staged_records[id(token)] = record
+        return token, record, (tuple(staged_units), staged_records, sequence + 1)
+
+    def prepare_consumption(item, reservation, unit_index, work_class):
+        """No mutation: exact charge plus prospective consumed ledger index."""
+        record = reservation_for(item, reservation)
+        index = unit_ordinal(unit_index, len(item.budget.index[0]))
+        if type(work_class) is not CanonicalDescriptor:
+            raise IngressAbort(FailureCode.BUDGET_WORKCLASS_MISMATCH)
+        try:
+            work_bytes = canonical_identity_bytes(work_class)
+        except (TypeError, ValueError) as error:
+            raise IngressAbort(FailureCode.BUDGET_WORKCLASS_MISMATCH) from error
+        if work_bytes != canonical_identity_bytes(record.work_class):
+            raise IngressAbort(FailureCode.BUDGET_WORKCLASS_MISMATCH)
+        units, records, sequence = item.budget.index
+        if index not in record.units or units[index].state != "RESERVED":
+            raise IngressAbort(FailureCode.MISSING_BUDGET_CHARGE)
+        if units[index].reservation != record.identity:
+            raise IngressAbort(FailureCode.INTERNAL_CONTRACT_VIOLATION)
+        image = _snapshot(
+            CanonicalDescriptor(
+                "ChargeFields",
+                (
+                    item.identity,
+                    record.identity,
+                    CanonicalDescriptor(
+                        "InvocationChargeUnitIdentity", (record.identity, index)
+                    ),
+                    record.work_class,
+                ),
+            )
+        )
+        output = BudgetChargeView(*image.values)
+        staged = list(units)
+        staged[index] = _Unit("CONSUMED", units[index].reservation)
+        return output, (tuple(staged), records, sequence)
+
     def retire_unused(item: _Invocation) -> None:
         units, records, sequence = item.budget.index
         retirement = CanonicalDescriptor(
@@ -307,54 +390,8 @@ def _build_invocation_system():
             if type(work_class) is not CanonicalDescriptor:
                 raise IngressAbort(FailureCode.INVALID_INPUT)
             with ledger_access(self, authority, revision, active=True) as (_, item):
-                units, records, sequence = item.budget.index
-                if required_units > len(units):
-                    raise IngressAbort(FailureCode.BUDGET_ABORT)
-                available = tuple(
-                    index
-                    for index, unit in enumerate(units)
-                    if unit.state == "AVAILABLE"
-                )
-                if required_units > len(available):
-                    raise IngressAbort(FailureCode.BUDGET_ABORT)
-                chosen = available[
-                    :required_units
-                ]  # Administrative unit IDs, not semantic candidates.
-                try:
-                    work = _snapshot(work_class)
-                    identity = CanonicalDescriptor(
-                        "InvocationReservationIdentity", (item.identity, sequence, work)
-                    )
-                    image = canonical_identity_bytes(
-                        CanonicalDescriptor(
-                            "ReservationFields", (identity, chosen, work)
-                        )
-                    )
-                except (TypeError, ValueError) as error:
-                    raise IngressAbort(FailureCode.INVALID_INPUT) from error
-                # Reserve only an envelope whose complete charge data also fits.
-                # This is prospective representation validation, not a charge,
-                # execution permit or published result. All ordinal sizes fit
-                # the largest chosen unit under the frozen 256-unit bound.
-                try:
-                    BudgetChargeView(
-                        item.identity,
-                        identity,
-                        CanonicalDescriptor(
-                            "InvocationChargeUnitIdentity", (identity, chosen[-1])
-                        ),
-                        work,
-                    )
-                except ValueError as error:
-                    raise IngressAbort(FailureCode.CAPACITY_ABORT) from error
-                token = object.__new__(BudgetReservation)
-                record = _Reservation(token, identity, chosen, work, image)
-                staged_units = list(units)
-                for index in chosen:
-                    staged_units[index] = _Unit("RESERVED", identity)
-                staged_records = dict(records)
-                staged_records[id(token)] = record
-                item.budget.index = (tuple(staged_units), staged_records, sequence + 1)
+                token, _, staged = prepare_reservation(item, required_units, work_class)
+                item.budget.index = staged
                 return token
 
         def reservation_view(
@@ -379,39 +416,10 @@ def _build_invocation_system():
         ) -> BudgetChargeView:
             """Accounting transition only: no permit, dispatch or semantic effect."""
             with ledger_access(self, authority, revision, active=True) as (_, item):
-                record = reservation_for(item, reservation)
-                index = unit_ordinal(unit_index, len(item.budget.index[0]))
-                if type(work_class) is not CanonicalDescriptor:
-                    raise IngressAbort(FailureCode.BUDGET_WORKCLASS_MISMATCH)
-                try:
-                    work_bytes = canonical_identity_bytes(work_class)
-                except (TypeError, ValueError) as error:
-                    raise IngressAbort(FailureCode.BUDGET_WORKCLASS_MISMATCH) from error
-                if work_bytes != canonical_identity_bytes(record.work_class):
-                    raise IngressAbort(FailureCode.BUDGET_WORKCLASS_MISMATCH)
-                units, records, sequence = item.budget.index
-                if index not in record.units or units[index].state != "RESERVED":
-                    raise IngressAbort(FailureCode.MISSING_BUDGET_CHARGE)
-                if units[index].reservation != record.identity:
-                    raise IngressAbort(FailureCode.INTERNAL_CONTRACT_VIOLATION)
-                # Build all returned data before consuming the charge.
-                image = _snapshot(
-                    CanonicalDescriptor(
-                        "ChargeFields",
-                        (
-                            item.identity,
-                            record.identity,
-                            CanonicalDescriptor(
-                                "InvocationChargeUnitIdentity", (record.identity, index)
-                            ),
-                            record.work_class,
-                        ),
-                    )
+                output, staged = prepare_consumption(
+                    item, reservation, unit_index, work_class
                 )
-                output = BudgetChargeView(*image.values)
-                staged = list(units)
-                staged[index] = _Unit("CONSUMED", units[index].reservation)
-                item.budget.index = (tuple(staged), records, sequence)
+                item.budget.index = staged
                 return output
 
         def retire(self, authority: object, revision: int, reservation: object) -> None:
@@ -605,6 +613,8 @@ def _build_invocation_system():
                         # Fixed private Unit-4 child, not a caller callback. No
                         # asynchronous drain/wait occurs under this barrier.
                         item.cie_child.parent_close()
+                    if item.work_owner is not None:
+                        item.work_owner.parent_close()
                     return output
                 return view(domain, item)
 
@@ -660,6 +670,7 @@ def _build_invocation_system():
                 domain = _Domain(ingress, runtime, initial_budget, capacity)
                 domain.owner_id = id(owner)
 
+                @_deferred_cleanup
                 def discard(reference: ReferenceType) -> None:
                     # Every runtime/ledger operation pins its owner. No use is
                     # in flight here; no lifecycle wait or reverse acquisition.
@@ -673,6 +684,8 @@ def _build_invocation_system():
                         if item.lifecycle[0] is InvocationState.CLOSING:
                             if item.cie_child is not None:
                                 item.cie_child.parent_close()
+                            if item.work_owner is not None:
+                                item.work_owner.parent_close()
                             retire_unused(item)
                             item.lifecycle = (
                                 InvocationState.CLOSED,
@@ -739,11 +752,34 @@ def _build_invocation_system():
                         current(item, revision, active=True)
                 yield domain, item, binding
 
+    @contextmanager
+    def pinned_work_budget(runtime, authority, revision, ledger):
+        # Never call this from beneath Arena: Core -> lifecycle -> ledger.
+        with (
+            pinned_cie_parent(runtime, authority, revision, core=True) as (
+                domain,
+                item,
+                binding,
+            ),
+            access(ledger, "LEDGER") as (budget_domain, registered),
+        ):
+            if (
+                budget_domain is not domain
+                or registered is not item
+                or item.ledger is not ledger
+            ):
+                raise IngressAbort(FailureCode.AMBIGUOUS_BUDGET_OWNER)
+            with item.budget.lock:
+                yield domain, item, binding
+
     return (
         InvocationRuntime,
         InvocationBudgetLedger,
         create_invocation_runtime,
         pinned_cie_parent,
+        pinned_work_budget,
+        prepare_reservation,
+        prepare_consumption,
     )
 
 
@@ -752,5 +788,8 @@ def _build_invocation_system():
     InvocationBudgetLedger,
     create_invocation_runtime,
     _pinned_cie_parent,
+    _pinned_work_budget,
+    _prepare_reservation,
+    _prepare_consumption,
 ) = _build_invocation_system()
 del _build_invocation_system

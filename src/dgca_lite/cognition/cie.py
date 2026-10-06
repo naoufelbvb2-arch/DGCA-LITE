@@ -36,6 +36,7 @@ from .identity import (
 )
 from .ingress import _snapshot
 from .invocation import InvocationRuntime, _pinned_cie_parent
+from .locks import RankedBarrier, _deferred_cleanup
 from .policy import DEFAULT_VALUE_LIMITS
 from .serialization import canonical_identity_bytes
 from .types import FailureCode, InvocationState
@@ -71,6 +72,8 @@ def _build_cie_system():
         epochs: dict = field(default_factory=dict)
         stage_ids: set = field(default_factory=set)
         retired: bool = False
+        opened: bool = False
+        work_attached: bool = False
 
     @dataclass(slots=True)
     class _Epoch:
@@ -79,7 +82,7 @@ def _build_cie_system():
         invocation: object
         binding: CIEBinding
         binding_bytes: bytes
-        lock: object = field(default_factory=RLock)
+        lock: object = field(default_factory=lambda: RankedBarrier(3))
         snapshot: object = None
         pending: object = None
         terminal: str = ""
@@ -251,6 +254,7 @@ def _build_cie_system():
                     )
                     key = id(token)
 
+                    @_deferred_cleanup
                     def discard_epoch(reference):
                         with _pinned_cie_parent(runtime.parent, authority), epoch.lock:
                             if not epoch.terminal:
@@ -280,6 +284,7 @@ def _build_cie_system():
                         item.cie_child = epoch
                         item.cie_sequence = next_sequence
                         item.nondelegated_children = next_children
+                        runtime.opened = True
                     return token
                 except (TypeError, ValueError) as error:
                     raise CIEAbort(FailureCode.CAPACITY_ABORT) from error
@@ -510,6 +515,7 @@ def _build_cie_system():
             owner = object.__new__(CIERuntime)
             runtime = _Runtime(parent, frozen_policy, l2, l3)
 
+            @_deferred_cleanup
             def discard(reference):
                 with _pinned_cie_parent(parent):
                     for epoch in runtime.epochs.values():
@@ -534,8 +540,46 @@ def _build_cie_system():
                 domain.cie_attached = True
             return owner
 
-    return CIERuntime, create_cie_runtime
+    @contextmanager
+    def pinned_work_policy(handle, parent):
+        with access(handle, "RUNTIME") as (runtime, _):
+            if runtime.parent is not parent or runtime.opened or runtime.work_attached:
+                raise CIEAbort(FailureCode.INVALID_POLICY_BINDING)
+            yield runtime
+
+    @contextmanager
+    def pinned_cie_work(handle, token, item, snapshot, core_binding):
+        """Arena-only bridge. Trusted dispatch already holds Core/Life/Ledger."""
+        with (
+            access(handle, "RUNTIME") as (runtime, _),
+            access(token, "CIE") as (own, epoch),
+        ):
+            if own is not runtime or epoch.invocation is not item:
+                raise CIEAbort(FailureCode.CIE_STALE)
+            with epoch.lock:
+                require_live(epoch)
+                if item.lifecycle != (
+                    InvocationState.ACTIVE,
+                    epoch.binding.invocation_revision,
+                ):
+                    terminal_failure(epoch, FailureCode.PARENT_AUTHORITY_STALE)
+                current = CognitiveEnvironmentBinding(
+                    core_binding, runtime.l2_policy, runtime.l3_policy
+                )
+                if canonical_identity_bytes(current) != canonical_identity_bytes(
+                    epoch.binding.environment
+                ):
+                    terminal_failure(epoch, FailureCode.ENVIRONMENT_STALE)
+                if type(snapshot) is not SnapshotBinding or canonical_identity_bytes(
+                    snapshot
+                ) != canonical_identity_bytes(epoch.snapshot.binding):
+                    raise CIEAbort(FailureCode.CIE_STALE)
+                yield
+
+    return CIERuntime, create_cie_runtime, pinned_work_policy, pinned_cie_work
 
 
-CIERuntime, create_cie_runtime = _build_cie_system()
+CIERuntime, create_cie_runtime, _pinned_work_policy, _pinned_cie_work = (
+    _build_cie_system()
+)
 del _build_cie_system

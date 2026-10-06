@@ -51,21 +51,32 @@ from .identity import (
     _validated_record_fields,
     canonical_dependencies,
 )
+from .locks import RankedBarrier, _deferred_cleanup
 from .policy import DEFAULT_VALUE_LIMITS
 from .serialization import canonical_identity_bytes
 from .types import AssertionBasis, DependencyKind, FailureCode
 
 
-def _snapshot(value: object) -> object:
+def _snapshot(value: object, *, limits=None) -> object:
     """Deep independent closed-data snapshot; recheck boundedness while copying.
 
     Frozen-record bypass/races cannot share caller references into issuance state.
     The final image must exactly equal the validated initial image or fail closed.
     """
-    before = canonical_identity_bytes(value)
+    custom_limits = limits is not None
+    if not custom_limits:
+        limits = DEFAULT_VALUE_LIMITS
+
+    def encode(item):
+        # Preserve the default codec call path, including its established
+        # validation/fault-injection contract. Unit 5 supplies tighter bounds.
+        if not custom_limits:
+            return canonical_identity_bytes(item)
+        return canonical_identity_bytes(item, limits)
+
+    before = encode(value)
     nodes = 0
     ancestors: set[int] = set()
-    limits = DEFAULT_VALUE_LIMITS
 
     def clone(item: object, depth: int) -> object:
         nonlocal nodes
@@ -84,7 +95,7 @@ def _snapshot(value: object) -> object:
             nodes += 2
             if nodes > limits.max_nodes or depth + 1 > limits.max_depth:
                 raise ValueError("issuance snapshot exceeds node/depth bound")
-            canonical_identity_bytes(item)  # Only a genuine closed Enum can pass.
+            encode(item)  # Only a genuine closed Enum can pass.
             return item
         identity = id(item)
         if identity in ancestors:
@@ -108,7 +119,7 @@ def _snapshot(value: object) -> object:
             ancestors.remove(identity)
 
     result = clone(value, 0)
-    if canonical_identity_bytes(result) != before:
+    if encode(result) != before:
         raise ValueError("issuance input changed during snapshot")
     return result
 
@@ -126,7 +137,7 @@ def _build_authority_system():
     @dataclass(slots=True)
     class _CoreAudit:
         core: ReferenceType
-        barrier: object = field(default_factory=RLock)
+        barrier: object = field(default_factory=lambda: RankedBarrier(0))
         last_observation: tuple[int, int, int] = (-1, -1, -1)
         last_domain: object = None
 
@@ -152,7 +163,7 @@ def _build_authority_system():
         formal: CanonicalDescriptor
         capacity: int
         core_audit: _CoreAudit
-        barrier: object = field(default_factory=RLock)
+        barrier: object = field(default_factory=lambda: RankedBarrier(0))
         domain_nonce: object = field(default_factory=object)
         revision: int = 0
         closed: bool = False
@@ -783,6 +794,7 @@ def _build_authority_system():
                 )
             )
 
+            @_deferred_cleanup
             def discard(reference: ReferenceType) -> None:
                 # Every use pins the owner. At this point there is no in-flight
                 # use, so cleanup needs no Core barrier (nor lock inversion).
