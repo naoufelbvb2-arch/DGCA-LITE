@@ -853,6 +853,14 @@ No opaque semantic metadata may be inspected by schemas.
 
 `DeepReferentClosure` recursively validates that every referent is lawful, bounded, type-correct, and already available through the authorized semantic construction path.
 
+The closed FAB-AST vocabulary includes:
+
+```text
+GroundState(Participant,StateIdentity)
+```
+
+Both `Participant` and `StateIdentity` are closed ground referents governed by `DeepReferentClosure`. `GroundRelation(...)`, `GroundState(Participant,StateIdentity)`, and `Assign(Entity,Slot,Value)` are distinct semantic forms with no implicit conversion.
+
 No schema may manufacture arbitrary new semantic participants, relation identities, or operators outside its declared constructor closure.
 
 ---
@@ -2303,11 +2311,37 @@ A formal premise:
 MutuallyExclusive(S_1,S_2)
 \]
 
-may establish incompatibility of simultaneous matching states for the same bound participant/scope according to the schema.
+has canonical `StateIdentity` operands, not arbitrary proposition contents.
+
+Participant binding is explicit:
+
+```text
+ParticipantBinding(GroundState(X,S)) = X
+StateIdentityOf(GroundState(X,S)) = S
+```
+
+`ParticipantBinding` is undefined for every other generic FAB proposition form in v0 unless that form's canonical schema explicitly defines a participant role. In particular, `ParticipantBinding(R(A,B))` is undefined for an ordinary ground binary relation.
+
+Participant identity must never be inferred from first argument, second argument, shared argument, overlapping argument, relation-name convention, or lexical convention.
+
+A lawful incompatibility requires exact participant assertions:
+
+```text
+GroundState(X,S1)
+GroundState(X,S2)
+```
+
+or the schema-declared symmetric state-role ordering, together with an active lawful `MutuallyExclusive(S1,S2)`, exact same canonical `Participant X`, exact lawful same `ScopeIdentity`, applicable AEC, current constraint environment/use binding, complete required coverage, and the exact EDS construction specified by §73.
+
+State identity comparison uses complete canonical typed identity.
 
 Mutual exclusion is symmetric only because this schema explicitly declares symmetry.
 
 `Different(S1,S2)` does not create mutual exclusion.
+
+Ordinary relation assertions such as `R(A,B)` and `R(B,C)` are not eligible participant-state assertions for this family merely because they contain or share referents. `MutuallyExclusive(R(A,B),R(B,C))` is not a lawful v0 premise because its operands are proposition contents rather than state identities; formal constraint-shape validation must reject it rather than interpret it. It cannot block otherwise lawful transitive composition, subject to all other canonical contracts.
+
+`Assign(X,Slot,V)` is not reinterpreted through this family. Slot/value exclusivity remains governed only by `SingleValued(Slot)` and its existing exact assignment semantics.
 
 Malformed:
 
@@ -2315,7 +2349,7 @@ Malformed:
 MutuallyExclusive(S,S)
 \]
 
-is rejected or yields no valid finding according to schema validation; it cannot manufacture self-conflict.
+is rejected by formal constraint-shape validation; it cannot manufacture self-conflict.
 
 ## 70.3 Single-Valued Slot Conflict
 
@@ -2510,6 +2544,8 @@ RelevantConstraints(S)\subseteq PreflightProfile(S)
 \]
 
 Unknown interaction is conservatively included.
+
+`EXPLICIT_MUTUAL_EXCLUSION` structurally interacts only with eligible `GroundState` participant assertions. Generic relation argument position, overlap, or shared referents do not create interaction.
 
 A `ConstraintPreflightNotApplicable` declaration requires an explicit `NoConstraintInteractionCertificate`.
 
@@ -3572,6 +3608,10 @@ The implementation must prove at least:
 - text `"not P"` cannot mint `FormalNegation(P)`;
 - formal negation targets exact proposition content;
 - `MutuallyExclusive` symmetry is schema-declared;
+- Explicit Mutual Exclusion never infers participant roles from relation argument position or overlap;
+- `MutuallyExclusive` operands are state identities, not arbitrary proposition contents;
+- only explicit `GroundState` participant binding can activate this v0 family;
+- `R(A,B)` and `R(B,C)` sharing `B` does not by itself create a mutual-exclusion interaction;
 - `SingleValued` means at-most-one, not exactly-one;
 - missing value is not a violation;
 - derived/retrieved constraint content cannot self-activate;
