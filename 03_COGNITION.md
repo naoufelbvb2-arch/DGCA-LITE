@@ -1945,6 +1945,55 @@ The relation name alone, lexical similarity, or repeated path does not grant tra
 
 No hard-coded semantic relation-name table exists.
 
+## 60.3 Formal Rule-Premise Basis Admissibility
+
+The two generic v0 inference schemas distinguish **formal rule-premise roles** from ordinary assertion-premise roles.
+
+The canonical admissible basis set for a formal rule-premise role is:
+
+```text
+FORMAL_GIVEN
+FORMAL_ASSUMPTION
+```
+
+For `GROUND_MODUS_PONENS`, the `conditional` role is a formal rule-premise role.
+
+For `TRANSITIVE_COMPOSITION`, the explicit `Transitive(R)` property role is a formal rule-premise role.
+
+Assertions with basis:
+
+```text
+DERIVED
+EXTERNAL_OBSERVATION
+INTERNAL_RETRIEVAL
+HYPOTHETICAL
+PREDICTION_VIEW
+CAUSAL_RESULT_VIEW
+```
+
+cannot occupy either formal rule-premise role merely because their canonical content is a `GroundConditional(...)` or `Transitive(R)`.
+
+Such assertions remain lawful assertions under their original basis and may be represented, returned, matched as ordinary content where a schema permits, or preserved as provenance-bearing results. Their content shape does not promote their basis or grant formal rule-premise authority.
+
+Ordinary non-rule premise roles remain governed by their own canonical scope, AEC, dependency, lineage, constraint, and schema admissibility contracts. A lawful `DERIVED` ordinary proposition or relation assertion may therefore participate in a later synchronous round.
+
+A `FORMAL_ASSUMPTION` used in a formal rule-premise role retains its assumption dependency root. No assumption discharge occurs.
+
+Therefore:
+
+```text
+DerivedGroundConditional != FormalConditionalPremiseAuthority
+DerivedTransitiveProperty != TransitivityActivationAuthority
+```
+
+and:
+
+```text
+SameContentBytes != FormalReasoningIngressAuthority
+```
+
+This role-level restriction does not make a formal premise an executable schema. The executable inference authority remains the frozen `InferenceSchema`.
+
 ---
 
 # 61. Explicitly Unavailable Logic in v0
@@ -3508,6 +3557,9 @@ The implementation must prove at least:
 - no generic scope broadening exists;
 - source replay is idempotent and support multiplicity does not create a Cartesian derivation frontier;
 - only the two canonical generic v0 schema families are executable;
+- a `DERIVED GroundConditional` cannot occupy the Modus Ponens formal conditional role;
+- a `DERIVED Transitive(R)` cannot activate transitive composition;
+- a lawful `DERIVED` ordinary proposition/relation may serve as a later-round ordinary premise when all AEC/scope/lineage/constraint requirements hold;
 - fixed point requires a complete empty next frontier.
 
 ---
