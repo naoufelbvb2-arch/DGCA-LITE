@@ -12,6 +12,7 @@ from .effect_types import _MechanicalEffectOperation
 from .identity import CanonicalDescriptor, SnapshotBinding
 from .ingress import _snapshot
 from .policy import ValueLimits
+from .reasoning.schemas import ReasoningOperation, ReasoningPolicy, catalogue
 from .serialization import canonical_identity_bytes
 from .types import WorkEffectClass
 
@@ -42,6 +43,7 @@ _MEMBERS = tuple(
     for cls in (
         OperationType,
         _MechanicalEffectOperation,
+        ReasoningOperation,
         BudgetClass,
         AuthorityRequirement,
         PublicationPolicy,
@@ -111,8 +113,8 @@ class ResourceEnvelope:
     def canonical_descriptor(self):
         for value, ceiling in (
             (self.charge_units, 256),
-            (self.max_nodes, 256),
-            (self.encoded_input_bytes, 32768),
+            (self.max_nodes, 4096),
+            (self.encoded_input_bytes, 262144),
         ):
             if type(value) is not int or not 1 <= value <= ceiling:
                 raise ValueError("invalid finite resource envelope")
@@ -127,7 +129,7 @@ class ResourceEnvelope:
 
 @dataclass(frozen=True, slots=True)
 class OperationContract:
-    operation_type: OperationType | _MechanicalEffectOperation
+    operation_type: OperationType | _MechanicalEffectOperation | ReasoningOperation
     budget_class: BudgetClass
     effect_class: WorkEffectClass
     authority_requirements: tuple[AuthorityRequirement, ...]
@@ -155,7 +157,11 @@ class OperationContract:
                     self.operation_type,
                     _MechanicalEffectOperation
                     if type(self.operation_type) is _MechanicalEffectOperation
-                    else OperationType,
+                    else (
+                        ReasoningOperation
+                        if type(self.operation_type) is ReasoningOperation
+                        else OperationType
+                    ),
                 ),
                 _label(self.budget_class, BudgetClass),
                 _label(self.effect_class, WorkEffectClass),
@@ -170,10 +176,41 @@ class OperationContract:
         canonical_identity_bytes(self.canonical_descriptor())
 
 
-def compiled_contract(policy, operation, frozen_input):
+def work_limits(policy, operation, reasoning_policy=None):
+    if type(operation) is ReasoningOperation:
+        _label(operation, ReasoningOperation)
+        if type(reasoning_policy) is not ReasoningPolicy:
+            raise TypeError("reasoning catalogue not installed")
+        return reasoning_policy.value_limits
+    return policy.value_limits
+
+
+def compiled_contract(policy, operation, frozen_input, reasoning_policy=None):
     """Only trusted built-in implementations. No plugins, callbacks or overrides."""
     if type(policy) is not WorkPolicy:
         raise TypeError("exact trusted policy required")
+    if type(operation) is ReasoningOperation:
+        literal = _label(operation, ReasoningOperation)
+        if operation is ReasoningOperation.PUBLISH:
+            raise TypeError("publication is not pure work")
+        limits = work_limits(policy, operation, reasoning_policy)
+        data = canonical_identity_bytes(frozen_input, limits)
+        if len(data) > 262144:
+            raise ValueError("complete reasoning input exceeds byte bound")
+        return OperationContract(
+            operation,
+            BudgetClass.CHARGED_WORK,
+            WorkEffectClass.PURE_COMPUTE,
+            (
+                AuthorityRequirement.CIE_CURRENT,
+                AuthorityRequirement.ENVIRONMENT_CURRENT,
+                AuthorityRequirement.INVOCATION_CURRENT,
+                AuthorityRequirement.SNAPSHOT_CURRENT,
+            ),
+            CanonicalDescriptor("ReasoningWorkClass", (literal,)),
+            ResourceEnvelope(1, limits.max_nodes, len(data)),
+            PublicationPolicy.STAGED_IMMUTABLE_ONLY,
+        )
     literal = _label(operation, OperationType)
     data = canonical_identity_bytes(frozen_input, policy.value_limits)
     if len(data) > policy.max_input_bytes:
@@ -197,9 +234,9 @@ def compiled_contract(policy, operation, frozen_input):
     )
 
 
-def compiled_policy_descriptor(policy):
+def compiled_policy_descriptor(policy, reasoning_policy=None):
     # Bind the complete frozen catalogue, not a caller's claimed contract.
-    return CanonicalDescriptor(
+    base = CanonicalDescriptor(
         "Unit5OperationCatalogue",
         (
             policy.canonical_descriptor(),
@@ -208,6 +245,13 @@ def compiled_policy_descriptor(policy):
                 for op in OperationType
             ),
         ),
+    )
+    return (
+        base
+        if reasoning_policy is None
+        else CanonicalDescriptor(
+            "Unit7WorkCatalogue", (base, catalogue(reasoning_policy))
+        )
     )
 
 
@@ -286,7 +330,7 @@ class PureWorkResultView:
         canonical_identity_bytes(self.canonical_descriptor())
 
 
-def freeze_work(policy, work):
+def freeze_work(policy, work, reasoning_policy=None):
     if type(work) is not FrozenWork:
         raise TypeError("closed frozen work required")
     # The tighter work-input bound must precede even general descriptor encoding.
@@ -298,12 +342,17 @@ def freeze_work(policy, work):
         work.owner_revision,
         work.snapshot_binding,
     )
-    canonical_identity_bytes(source, policy.value_limits)
-    frozen = _snapshot(source, limits=policy.value_limits)
+    if type(source_contract) is not OperationContract:
+        raise TypeError("closed contract required")
+    limits = work_limits(policy, source_contract.operation_type, reasoning_policy)
+    canonical_identity_bytes(source, limits)
+    frozen = _snapshot(source, limits=limits)
     if type(source_contract) is not OperationContract:
         raise TypeError("closed contract required")
     supplied_contract = _snapshot(source_contract.canonical_descriptor())
-    contract = compiled_contract(policy, source_contract.operation_type, frozen)
+    contract = compiled_contract(
+        policy, source_contract.operation_type, frozen, reasoning_policy
+    )
     if canonical_identity_bytes(
         contract.canonical_descriptor()
     ) != canonical_identity_bytes(supplied_contract):

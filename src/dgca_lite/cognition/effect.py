@@ -92,7 +92,7 @@ class CanonicalEffectDescriptor:
         canonical_identity_bytes(self.canonical_descriptor())
 
 
-def freeze_effect(policy, effect):
+def freeze_effect(policy, effect, *, payload_limits=None):
     if (
         type(policy) is not EffectPolicy
         or type(effect) is not CanonicalEffectDescriptor
@@ -109,8 +109,15 @@ def freeze_effect(policy, effect):
         effect.owner_binding,
         effect.execution_contract,
     )
-    payload = _snapshot(payload, limits=policy.payload_limits)
-    small = ValueLimits(32, 16, policy.max_scalar_bytes)
+    payload = _snapshot(
+        payload,
+        limits=policy.payload_limits if payload_limits is None else payload_limits,
+    )
+    small = (
+        ValueLimits(32, 16, policy.max_scalar_bytes)
+        if payload_limits is None
+        else ValueLimits(128, 48, policy.max_scalar_bytes)
+    )
     target = _snapshot(target, limits=small)
     scope = _snapshot(scope, limits=small)
     fields = _snapshot(
@@ -210,6 +217,19 @@ class EffectCommitView:
             self.commit_id.effect.canonical_descriptor()
         ) != canonical_identity_bytes(self.effect.canonical_descriptor()):
             raise ValueError("commit/effect mismatch")
+        if self.effect.effect_type == CanonicalDescriptor(
+            "EffectType", ("REASONING_PUBLISH",)
+        ):
+            # The complete effect is already present in commit_id. Avoid a
+            # second copy of a bounded reasoning publication's proof graph.
+            return CanonicalDescriptor(
+                "ReasoningEffectCommitView",
+                (
+                    self.commit_id.canonical_descriptor(),
+                    self.charge.canonical_descriptor(),
+                    self.status,
+                ),
+            )
         return CanonicalDescriptor(
             "EffectCommitView",
             (
@@ -224,8 +244,8 @@ class EffectCommitView:
         canonical_identity_bytes(self.canonical_descriptor())
 
 
-def clone_commit_view(policy, view):
-    effect = freeze_effect(policy, view.effect)
+def clone_commit_view(policy, view, *, payload_limits=None):
+    effect = freeze_effect(policy, view.effect, payload_limits=payload_limits)
     context = _snapshot(view.commit_id.authority_context)
     data = _snapshot(view.charge.canonical_descriptor())
     return EffectCommitView(

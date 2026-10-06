@@ -14,7 +14,7 @@ from .budget import BudgetChargeView
 from .cie import CIERuntime, _pinned_cie_work, _pinned_work_policy
 from .contracts import ControlPlaneOperation
 from .identity import CanonicalDescriptor, SnapshotBinding
-from .ingress import _snapshot
+from .ingress import _reasoning_sources, _snapshot
 from .invocation import (
     InvocationRuntime,
     _pinned_cie_parent,
@@ -32,7 +32,9 @@ from .operation import (
     compiled_contract,
     compiled_policy_descriptor,
     freeze_work,
+    work_limits,
 )
+from .reasoning.schemas import ReasoningOperation, ReasoningPolicy
 from .serialization import canonical_identity_bytes
 from .types import BudgetSourceKind, FailureCode, InvocationState, WorkEffectClass
 
@@ -54,6 +56,33 @@ def _closed_value_worker(frozen_input, permit, context):
     return _snapshot(frozen_input)
 
 
+def _permit_identity(work):
+    if type(work.contract.operation_type) is not ReasoningOperation:
+        return work.canonical_descriptor()
+    # The gate proves that the complete input arena is EXACTLY this immutable
+    # snapshot. Discovery/evaluation are deterministic functions of it + branch.
+    # Seed additionally binds every exact authorized source descriptor. This is
+    # a complete local reference identity, never a hash or caller-chosen key.
+    _, branch, extra = work.frozen_input.values
+    return CanonicalDescriptor(
+        "ExactReasoningWorkIdentity",
+        (
+            work.contract.canonical_descriptor(),
+            work.snapshot_binding,
+            branch,
+            extra if work.contract.operation_type is ReasoningOperation.SEED else None,
+        ),
+    )
+
+
+def _reasoning_source_bounds(policy, capabilities, internal_results):
+    if type(capabilities) is not tuple or type(internal_results) is not tuple:
+        raise IngressAbort(FailureCode.INVALID_INPUT)
+    # Bound the entire seed group before inspecting either container's members.
+    if len(capabilities) + len(internal_results) > policy.max_sources:
+        raise IngressAbort(FailureCode.CAPACITY_ABORT)
+
+
 def _build_work_system():
     registry_lock = RankedBarrier(5)
     handles = {}
@@ -67,6 +96,7 @@ def _build_work_system():
         owner_ref: object = None
         owners: dict = field(default_factory=dict)
         retired: bool = False
+        reasoning_policy: object = None
 
     @dataclass(slots=True)
     class _Permit:
@@ -123,7 +153,7 @@ def _build_work_system():
 
     def checked_work(runtime, work, item, revision):
         try:
-            frozen = freeze_work(runtime.policy, work)
+            frozen = freeze_work(runtime.policy, work, runtime.reasoning_policy)
         except (TypeError, ValueError, AttributeError) as error:
             raise IngressAbort(FailureCode.INVALID_INPUT) from error
         if frozen.contract.effect_class is not WorkEffectClass.PURE_COMPUTE:
@@ -151,17 +181,25 @@ def _build_work_system():
                 access(self, "RUNTIME") as (runtime, _),
                 _pinned_cie_parent(runtime.parent, authority, revision) as (_, item, _),
             ):
-                if type(operation) is not OperationType or not any(
-                    operation is op for op in OperationType
+                if type(operation) not in (
+                    OperationType,
+                    ReasoningOperation,
+                ) or not any(
+                    operation is op for op in (*OperationType, *ReasoningOperation)
                 ):
                     raise IngressAbort(FailureCode.UNKNOWN_OPERATION_TYPE)
                 if type(snapshot) is not SnapshotBinding:
                     raise IngressAbort(FailureCode.INVALID_INPUT)
                 try:
                     # The bounded representation check precedes cloning.
-                    canonical_identity_bytes(frozen_input, runtime.policy.value_limits)
-                    data = _snapshot(frozen_input, limits=runtime.policy.value_limits)
-                    contract = compiled_contract(runtime.policy, operation, data)
+                    limits = work_limits(
+                        runtime.policy, operation, runtime.reasoning_policy
+                    )
+                    canonical_identity_bytes(frozen_input, limits)
+                    data = _snapshot(frozen_input, limits=limits)
+                    contract = compiled_contract(
+                        runtime.policy, operation, data, runtime.reasoning_policy
+                    )
                     fields = _snapshot(
                         CanonicalDescriptor(
                             "FrozenOwner", (item.identity, revision, snapshot)
@@ -205,7 +243,7 @@ def _build_work_system():
                         binding = CanonicalDescriptor(
                             "WorkExecutionPermitBinding",
                             (
-                                frozen.canonical_descriptor(),
+                                _permit_identity(frozen),
                                 item.identity,
                                 revision,
                                 charge.canonical_descriptor(),
@@ -219,13 +257,23 @@ def _build_work_system():
                     return token, output
 
         def authorize_and_charge(
-            self, authority, revision, cie, ledger, reservation, prepared
+            self,
+            authority,
+            revision,
+            cie,
+            ledger,
+            reservation,
+            prepared,
+            *,
+            source_capabilities=None,
+            internal_results=(),
+            discovery_permit=None,
         ):
             """One linearizable Core/Life/Ledger/Arena/Owner/Registry transaction."""
             with (
                 access(self, "RUNTIME") as (runtime, _),
                 _pinned_work_budget(runtime.parent, authority, revision, ledger) as (
-                    _,
+                    domain,
                     item,
                     core,
                 ),
@@ -254,7 +302,52 @@ def _build_work_system():
                     raise IngressAbort(FailureCode.INVALID_INPUT) from error
                 with _pinned_cie_work(
                     runtime.cie, cie, item, frozen.snapshot_binding, core
-                ):
+                ) as epoch:
+                    if type(frozen.contract.operation_type) is ReasoningOperation:
+                        from .cie import _check_reasoning_capacity
+                        from .reasoning.runtime import (
+                            group_capacity,
+                            validate_work_input,
+                        )
+
+                        expected_sources = None
+                        if frozen.contract.operation_type is ReasoningOperation.SEED:
+                            from .reasoning.assertions import internal_retrieval_view
+
+                            _reasoning_source_bounds(
+                                runtime.reasoning_policy,
+                                source_capabilities,
+                                internal_results,
+                            )
+                            expected_sources = _reasoning_sources(
+                                domain.ingress, source_capabilities
+                            )
+                            expected_sources += tuple(
+                                internal_retrieval_view(v, frozen.snapshot_binding)
+                                for v in internal_results
+                            )
+                        discovered = None
+                        if (
+                            frozen.contract.operation_type
+                            is ReasoningOperation.EVALUATE
+                        ):
+                            discovered = completed_result(
+                                self,
+                                discovery_permit,
+                                item,
+                                frozen.snapshot_binding,
+                                ReasoningOperation.DISCOVER,
+                            )
+                        validate_work_input(
+                            frozen,
+                            epoch.snapshot,
+                            expected_sources,
+                            discovered,
+                            runtime.reasoning_policy,
+                        )
+                        _check_reasoning_capacity(
+                            epoch, group_capacity(frozen, runtime.reasoning_policy)
+                        )
                     owner = item.work_owner
                     if owner is None:
                         owner = _Owner(runtime)
@@ -279,7 +372,7 @@ def _build_work_system():
                             CanonicalDescriptor(
                                 "WorkExecutionPermitBinding",
                                 (
-                                    frozen.canonical_descriptor(),
+                                    _permit_identity(frozen),
                                     item.identity,
                                     revision,
                                     charge.canonical_descriptor(),
@@ -341,7 +434,9 @@ def _build_work_system():
                     if record.owner.closing or record.state != "ISSUED":
                         raise IngressAbort(FailureCode.OWNER_AUTHORITY_STALE)
                     try:
-                        frozen = freeze_work(runtime.policy, work)
+                        frozen = freeze_work(
+                            runtime.policy, work, runtime.reasoning_policy
+                        )
                     except (TypeError, ValueError, AttributeError) as error:
                         raise IngressAbort(FailureCode.INVALID_INPUT) from error
                     if (
@@ -354,7 +449,19 @@ def _build_work_system():
                     # One-shot claim occurs BEFORE leaving owner barriers.
                     record.state = "RUNNING"
                 try:
-                    output = _closed_value_worker(frozen.frozen_input, permit, context)
+                    if type(frozen.contract.operation_type) is ReasoningOperation:
+                        from .reasoning.runtime import compute
+
+                        output = compute(
+                            frozen.contract.operation_type,
+                            frozen.frozen_input,
+                            frozen.snapshot_binding,
+                            runtime.reasoning_policy,
+                        )
+                    else:
+                        output = _closed_value_worker(
+                            frozen.frozen_input, permit, context
+                        )
                     result = PureWorkResultView(binding, _snapshot(output))
                     private_result = PureWorkResultView(
                         _snapshot(binding), _snapshot(output)
@@ -367,8 +474,9 @@ def _build_work_system():
                         )
                     raise
                 with _pinned_cie_parent(runtime.parent), record.owner.lock:
-                    record.state = "DONE"
-                    if not record.owner.closing:
+                    if record.state != "RETIRED":
+                        record.state = "DONE"
+                    if not record.owner.closing and record.state != "RETIRED":
                         # Never retain the returned object's alias, including
                         # frozen-dataclass __setattr__ bypass on caller data.
                         record.output = private_result
@@ -467,7 +575,7 @@ def _build_work_system():
                                 ) == canonical_identity_bytes(record.output.output)
                             raise IngressAbort(FailureCode.EXEMPTION_CONTRACT_VIOLATION)
 
-    def create_work_runtime(parent, cie, *, policy=None):
+    def create_work_runtime(parent, cie, *, policy=None, reasoning_policy=None):
         """Trusted composition-root installation, once and before the first CIE."""
         if policy is None:
             policy = WorkPolicy()
@@ -479,7 +587,13 @@ def _build_work_system():
             raise IngressAbort(FailureCode.INVALID_INPUT)
         data = policy.canonical_descriptor().values
         frozen_policy = WorkPolicy(*data)
-        catalogue = compiled_policy_descriptor(frozen_policy)
+        if reasoning_policy is not None:
+            if type(reasoning_policy) is not ReasoningPolicy:
+                raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
+            reasoning_policy = ReasoningPolicy(
+                *reasoning_policy.canonical_descriptor().values
+            )
+        catalogue = compiled_policy_descriptor(frozen_policy, reasoning_policy)
         with (
             _pinned_cie_parent(parent) as (domain, _, _),
             _pinned_work_policy(cie, parent) as cie_state,
@@ -492,7 +606,9 @@ def _build_work_system():
                 )
             )
             owner = object.__new__(WorkRuntime)
-            runtime = _Runtime(parent, cie, frozen_policy)
+            runtime = _Runtime(
+                parent, cie, frozen_policy, reasoning_policy=reasoning_policy
+            )
             key = id(owner)
 
             @_deferred_cleanup
@@ -516,11 +632,140 @@ def _build_work_system():
                 handles[key] = registered
                 cie_state.l3_policy = l3
                 cie_state.work_attached = True
+                cie_state.reasoning_policy = reasoning_policy
                 domain.work_attached = True
             return owner
 
-    return WorkRuntime, create_work_runtime
+    def completed_result(handle, permit, item, snapshot, operation=None):
+        with (
+            access(handle, "RUNTIME") as (runtime, _),
+            access(permit, "PERMIT") as (own, record),
+        ):
+            if (
+                own is not runtime
+                or runtime.reasoning_policy is None
+                or record.authority is not item.authority
+            ):
+                raise IngressAbort(FailureCode.OWNER_AUTHORITY_STALE)
+            with record.owner.lock:
+                if (
+                    record.state != "DONE"
+                    or record.output is None
+                    or record.work is None
+                ):
+                    raise IngressAbort(FailureCode.OWNER_AUTHORITY_STALE)
+                if type(record.work.contract.operation_type) is not ReasoningOperation:
+                    raise IngressAbort(FailureCode.EXEMPTION_CONTRACT_VIOLATION)
+                if record.work.snapshot_binding != snapshot or (
+                    operation is not None
+                    and record.work.contract.operation_type is not operation
+                ):
+                    raise IngressAbort(FailureCode.CIE_STALE)
+                return _snapshot(record.output.output)
+
+    def source_input(
+        handle,
+        authority,
+        revision,
+        cie,
+        ledger,
+        snapshot,
+        capabilities,
+        internal_results=(),
+    ):
+        with (
+            access(handle, "RUNTIME") as (runtime, _),
+            _pinned_work_budget(runtime.parent, authority, revision, ledger) as (
+                domain,
+                item,
+                core,
+            ),
+        ):
+            if runtime.reasoning_policy is None:
+                raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
+            with _pinned_cie_work(
+                runtime.cie, cie, item, snapshot.binding, core
+            ) as epoch:
+                if snapshot.canonical_bytes != epoch.snapshot.canonical_bytes:
+                    raise IngressAbort(FailureCode.CIE_STALE)
+                _reasoning_source_bounds(
+                    runtime.reasoning_policy, capabilities, internal_results
+                )
+                sources = _reasoning_sources(domain.ingress, capabilities)
+                from .reasoning.assertions import internal_retrieval_view
+
+                sources += tuple(
+                    internal_retrieval_view(v, snapshot.binding)
+                    for v in internal_results
+                )
+                return CanonicalDescriptor(
+                    "ReasoningInput",
+                    (
+                        tuple(e.canonical_descriptor() for e in epoch.snapshot.entries),
+                        0,
+                        sources,
+                    ),
+                )
+
+    @contextmanager
+    def retire_epoch(handle, item, binding, terminal=True):
+        """Authority-reducing, rollback-safe cleanup under the parent Life gate.
+
+        The existing per-invocation permit map is prospectively bounded by its
+        budget. Peer owner barriers are never held together. A running worker
+        can finish locally, but cannot reattach its output to a retired record.
+        """
+        if not terminal:
+            yield
+            return
+        with access(handle, "RUNTIME") as (runtime, _):
+            owner = item.work_owner
+            if owner is None or owner.runtime is not runtime:
+                raise IngressAbort(FailureCode.OWNER_AUTHORITY_STALE)
+            with owner.lock:
+                records = tuple(
+                    (r, (r.state, r.work, r.image, r.binding, r.output))
+                    for r in owner.index[1].values()
+                    if r.work is not None
+                    and type(r.work.contract.operation_type) is ReasoningOperation
+                    and r.work.snapshot_binding.cie == binding
+                )
+                for r, _ in records:
+                    r.state = "RETIRED"
+                    r.work = r.image = r.binding = r.output = None
+            try:
+                yield
+            except BaseException:
+                with owner.lock:
+                    for r, old in records:
+                        r.state, r.work, r.image, r.binding, r.output = old
+                raise
+
+    def cleanup_epoch(handle, authority, binding):
+        with (
+            access(handle, "RUNTIME") as (runtime, _),
+            _pinned_cie_parent(runtime.parent, authority) as (_, item, _),
+        ):
+            if item.work_owner is not None:
+                with retire_epoch(handle, item, binding):
+                    pass
+
+    return (
+        WorkRuntime,
+        create_work_runtime,
+        completed_result,
+        source_input,
+        retire_epoch,
+        cleanup_epoch,
+    )
 
 
-WorkRuntime, create_work_runtime = _build_work_system()
+(
+    WorkRuntime,
+    create_work_runtime,
+    _completed_reasoning_result,
+    _reasoning_source_input,
+    _retire_reasoning_epoch,
+    _cleanup_reasoning_epoch,
+) = _build_work_system()
 del _build_work_system

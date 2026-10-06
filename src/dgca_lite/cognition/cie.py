@@ -75,6 +75,7 @@ def _build_cie_system():
         opened: bool = False
         work_attached: bool = False
         effect_attached: bool = False
+        reasoning_policy: object = None
 
     @dataclass(slots=True)
     class _Epoch:
@@ -310,6 +311,8 @@ def _build_cie_system():
             """
             with access(cie, "CIE") as (runtime, epoch):
                 check_runtime(self, runtime)
+                if runtime.reasoning_policy is not None:
+                    raise CIEAbort(FailureCode.EXEMPTION_CONTRACT_VIOLATION)
                 with epoch_guard(runtime, epoch, core=True):
                     if type(snapshot) is not ArenaSnapshot:
                         raise CIEAbort(FailureCode.INVALID_INPUT)
@@ -575,7 +578,7 @@ def _build_cie_system():
                     snapshot
                 ) != canonical_identity_bytes(epoch.snapshot.binding):
                     raise CIEAbort(FailureCode.CIE_STALE)
-                yield
+                yield epoch
 
     @contextmanager
     def pinned_effect_context(handle, parent, *, bootstrap=False):
@@ -587,12 +590,76 @@ def _build_cie_system():
                 raise CIEAbort(FailureCode.INVALID_POLICY_BINDING)
             yield runtime
 
+    def prepare_reasoning_publication(
+        handle, token, item, snapshot, core, additions, terminal
+    ):
+        """Prebuild an exact arena pointer under the already-held Arena gate."""
+        with (
+            access(handle, "RUNTIME") as (runtime, _),
+            access(token, "CIE") as (own, epoch),
+        ):
+            if (
+                own is not runtime
+                or epoch.invocation is not item
+                or runtime.reasoning_policy is None
+            ):
+                raise CIEAbort(FailureCode.CIE_STALE)
+            require_live(epoch)
+            if epoch.pending is not None or epoch.snapshot.binding != snapshot:
+                raise CIEAbort(FailureCode.CIE_STALE)
+            if snapshot.round_identity >= runtime.policy.max_rounds:
+                raise CIEAbort(FailureCode.CAPACITY_ABORT)
+            if (
+                type(additions) is not tuple
+                or len(additions) > runtime.policy.max_staged_entries
+            ):
+                raise CIEAbort(FailureCode.CAPACITY_ABORT)
+            entries = {entry_key(e): e for e in epoch.snapshot.entries}
+            for entry in additions:
+                frozen = freeze_entry(entry)
+                k = entry_key(frozen)
+                if (
+                    k in entries
+                    and entries[k].canonical_descriptor()
+                    != frozen.canonical_descriptor()
+                ):
+                    raise CIEAbort(FailureCode.INTERNAL_CONTRACT_VIOLATION)
+                entries[k] = frozen
+            candidate = ArenaSnapshot(
+                SnapshotBinding(
+                    epoch.binding,
+                    snapshot.arena_version + 1,
+                    snapshot.round_identity + 1,
+                ),
+                tuple(entries[k] for k in sorted(entries)),
+            )
+            checked_snapshot(runtime, candidate)
+            from .reasoning.assertions import semantic_records
+
+            semantic_records(candidate.entries, runtime.reasoning_policy)
+            return epoch, candidate
+
+    def reasoning_capacity(epoch, maximum_additions):
+        # Sole active arena owner; a complete group's structural slot envelope
+        # cannot be stolen while the genuine dispatch gate holds Life/Arena.
+        policy = epoch.runtime.policy
+        if (
+            type(maximum_additions) is not int
+            or maximum_additions < 0
+            or maximum_additions > policy.max_staged_entries
+            or len(epoch.snapshot.entries) + maximum_additions > policy.max_entries
+            or epoch.snapshot.binding.round_identity >= policy.max_rounds
+        ):
+            raise CIEAbort(FailureCode.CAPACITY_ABORT)
+
     return (
         CIERuntime,
         create_cie_runtime,
         pinned_work_policy,
         pinned_cie_work,
         pinned_effect_context,
+        prepare_reasoning_publication,
+        reasoning_capacity,
     )
 
 
@@ -602,5 +669,7 @@ def _build_cie_system():
     _pinned_work_policy,
     _pinned_cie_work,
     _pinned_effect_context,
+    _prepare_reasoning_publication,
+    _check_reasoning_capacity,
 ) = _build_cie_system()
 del _build_cie_system

@@ -822,6 +822,41 @@ def _build_authority_system():
             core_audits = next_audits
             return owner
 
+    def reasoning_sources(ingress, capabilities):
+        """Private read-only transfer; caller holds the existing Core barrier.
+
+        Genuine occurrence handles are validated; copied view fields never mint
+        a basis. No issuer, Core object or capability crosses this bridge.
+        """
+        if type(capabilities) is not tuple or len(capabilities) > 64:
+            raise IngressAbort(FailureCode.CAPACITY_ABORT)
+        state = state_for(ingress, "INVOCATION_CAUSE")
+        output = []
+        for cap in capabilities:
+            record = record_for(
+                state,
+                cap,
+                (
+                    FormalSourceOccurrenceCapability,
+                    AssumptionIssuanceCapability,
+                    ExternalOccurrenceCapability,
+                    FormalConstraintOccurrenceCapability,
+                ),
+            )
+            if record.role.startswith("CONSTRAINT"):
+                view = ActiveConstraintPremiseView(
+                    record.content,
+                    record.basis,
+                    record.scope,
+                    record.dependencies,
+                    record.source_authority,
+                    record.occurrence,
+                )
+            else:
+                view = assertion_view(record)
+            output.append(view.canonical_descriptor())
+        return tuple(output)
+
     return (
         TrustedIngressIssuer,
         FormalReasoningIngress,
@@ -831,6 +866,7 @@ def _build_authority_system():
         InvocationCauseIngress,
         pinned_invocation_cause,
         pinned_core_binding,
+        reasoning_sources,
     )
 
 
@@ -843,5 +879,6 @@ def _build_authority_system():
     InvocationCauseIngress,
     _pinned_invocation_cause,
     _pinned_core_binding,
+    _reasoning_sources,
 ) = _build_authority_system()
 del _build_authority_system

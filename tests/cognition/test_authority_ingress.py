@@ -538,7 +538,7 @@ def test_only_typed_authorized_constraint_premises_activate(kind):
         if kind == "FormalNegation":
             content = ClaimContentID(d(kind, claim()))
         elif kind == "MutuallyExclusive":
-            content = ClaimContentID(d(kind, claim("P"), claim("Q")))
+            content = ClaimContentID(d(kind, d("state", "P"), d("state", "Q")))
         else:
             content = ClaimContentID(d(kind, d("slot", 1)))
         first = owner.authorize_constraint_given(

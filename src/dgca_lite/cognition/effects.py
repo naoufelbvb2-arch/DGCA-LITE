@@ -13,7 +13,12 @@ from weakref import ref
 
 from .authority import IngressAbort, _OpaqueHandle
 from .budget import BudgetChargeView
-from .cie import CIERuntime, _pinned_cie_work, _pinned_effect_context
+from .cie import (
+    CIERuntime,
+    _pinned_cie_work,
+    _pinned_effect_context,
+    _prepare_reasoning_publication,
+)
 from .effect import (
     CanonicalEffectDescriptor,
     EffectCommitID,
@@ -43,8 +48,12 @@ from .operation import (
     ResourceEnvelope,
 )
 from .policy import ValueLimits
+from .reasoning.fab import d
+from .reasoning.schemas import ReasoningOperation, ReasoningPolicy
+from .reasoning.schemas import catalogue as reasoning_catalogue
 from .serialization import canonical_identity_bytes
 from .types import BudgetSourceKind, FailureCode, InvocationState, WorkEffectClass
+from .work import _completed_reasoning_result, _retire_reasoning_epoch
 
 _OPERATIONS = tuple((member, member.value) for member in _MechanicalEffectOperation)
 
@@ -108,6 +117,32 @@ def _before_effect_publish():
     """
 
 
+def _reasoning_contract(policy, target, payload, scope):
+    if type(policy) is not ReasoningPolicy:
+        raise IngressAbort(FailureCode.UNKNOWN_OPERATION_TYPE)
+    if type(target) is not CanonicalDescriptor or target.kind != "ReasoningArenaTarget":
+        raise IngressAbort(FailureCode.INVALID_INPUT)
+    if type(scope) is not CanonicalDescriptor or scope.kind != "ReasoningArenaScope":
+        raise IngressAbort(FailureCode.INVALID_SCOPE)
+    data = canonical_identity_bytes(payload, policy.value_limits)
+    if len(data) > 262144:
+        raise IngressAbort(FailureCode.CAPACITY_ABORT)
+    return OperationContract(
+        ReasoningOperation.PUBLISH,
+        BudgetClass.CHARGED_WORK,
+        WorkEffectClass.OPERATIONAL_EFFECT,
+        (
+            AuthorityRequirement.CIE_CURRENT,
+            AuthorityRequirement.ENVIRONMENT_CURRENT,
+            AuthorityRequirement.INVOCATION_CURRENT,
+            AuthorityRequirement.SNAPSHOT_CURRENT,
+        ),
+        d("ReasoningPublishWorkClass"),
+        ResourceEnvelope(1, policy.value_limits.max_nodes, len(data)),
+        PublicationPolicy.SEPARATE_EFFECT_GATE_REQUIRED,
+    )
+
+
 def _build_effect_system():
     registry_lock = RankedBarrier(5)
     handles = {}
@@ -121,6 +156,7 @@ def _build_effect_system():
         owner_ref: object = None
         owners: dict = field(default_factory=dict)
         retired: bool = False
+        reasoning_policy: object = None
 
     @dataclass(slots=True)
     class _Owner:
@@ -152,6 +188,10 @@ def _build_effect_system():
         del owner
 
     def operation_for(runtime, effect):
+        if runtime.reasoning_policy is not None and effect.effect_type == d(
+            "EffectType", ReasoningOperation.PUBLISH.value
+        ):
+            return ReasoningOperation.PUBLISH
         if not runtime.mechanical:
             raise IngressAbort(FailureCode.UNKNOWN_OPERATION_TYPE)
         kind = effect.effect_type
@@ -163,7 +203,8 @@ def _build_effect_system():
 
     def frozen_request(runtime, item, revision, effect, snapshot):
         try:
-            if not runtime.mechanical:
+            reasoning = runtime.reasoning_policy is not None
+            if not runtime.mechanical and not reasoning:
                 raise IngressAbort(FailureCode.UNKNOWN_OPERATION_TYPE)
             if type(effect) is not CanonicalEffectDescriptor:
                 raise TypeError("exact effect descriptor required")
@@ -171,8 +212,16 @@ def _build_effect_system():
             # their OUTER shapes before cloning/inspecting any members.
             for value, kind, count in (
                 (effect.effect_type, "EffectType", 1),
-                (effect.target_identity, "MechanicalTarget", 1),
-                (effect.scope_binding, "MechanicalScope", 1),
+                (
+                    effect.target_identity,
+                    "ReasoningArenaTarget" if reasoning else "MechanicalTarget",
+                    1,
+                ),
+                (
+                    effect.scope_binding,
+                    "ReasoningArenaScope" if reasoning else "MechanicalScope",
+                    1,
+                ),
                 (effect.owner_binding, "EffectOwnerBinding", 2),
                 (effect.execution_contract, "OperationContract", 7),
             ):
@@ -186,15 +235,25 @@ def _build_effect_system():
                     raise IngressAbort(
                         FailureCode.INVALID_INPUT, "effect metadata outer envelope"
                     )
-            frozen = freeze_effect(runtime.policy, effect)
+            limits = runtime.reasoning_policy.value_limits if reasoning else None
+            frozen = freeze_effect(runtime.policy, effect, payload_limits=limits)
             snapshot = _snapshot(snapshot)
             operation = operation_for(runtime, frozen)
-            contract = _effect_contract(
-                runtime.policy,
-                operation,
-                frozen.target_identity,
-                frozen.canonical_payload,
-                frozen.scope_binding,
+            contract = (
+                _reasoning_contract(
+                    runtime.reasoning_policy,
+                    frozen.target_identity,
+                    frozen.canonical_payload,
+                    frozen.scope_binding,
+                )
+                if reasoning
+                else _effect_contract(
+                    runtime.policy,
+                    operation,
+                    frozen.target_identity,
+                    frozen.canonical_payload,
+                    frozen.scope_binding,
+                )
             )
             if type(revision) is not int or revision < 0:
                 raise IngressAbort(FailureCode.INVALID_INPUT)
@@ -211,11 +270,22 @@ def _build_effect_system():
                 raise IngressAbort(FailureCode.EFFECT_PAYLOAD_MISMATCH)
             if contract.effect_class is not WorkEffectClass.OPERATIONAL_EFFECT:
                 raise IngressAbort(FailureCode.EXEMPTION_CONTRACT_VIOLATION)
-            needs_cie = operation is _MechanicalEffectOperation.CIE_AUDIT_ONLY
+            needs_cie = (
+                reasoning or operation is _MechanicalEffectOperation.CIE_AUDIT_ONLY
+            )
             if needs_cie and type(snapshot) is not SnapshotBinding:
                 raise IngressAbort(FailureCode.CIE_STALE)
             if not needs_cie and snapshot is not None:
                 raise IngressAbort(FailureCode.INVALID_SCOPE)
+            if reasoning:
+                from .reasoning.constraints import snapshot_ref
+
+                if frozen.target_identity != d(
+                    "ReasoningArenaTarget", snapshot_ref(snapshot)
+                ) or frozen.scope_binding != d(
+                    "ReasoningArenaScope", snapshot.cie.identity
+                ):
+                    raise IngressAbort(FailureCode.EFFECT_PAYLOAD_MISMATCH)
             context = CanonicalDescriptor(
                 "EffectAuthorityContext",
                 (frozen.owner_binding, frozen.environment_revision, snapshot),
@@ -276,7 +346,15 @@ def _build_effect_system():
         with owner.lock, registry_lock:
             previous = owner.index.get(identity.canonical_bytes)
             if previous is not None:
-                return clone_commit_view(runtime.policy, previous)
+                return clone_commit_view(
+                    runtime.policy,
+                    previous,
+                    payload_limits=(
+                        runtime.reasoning_policy.value_limits
+                        if runtime.reasoning_policy
+                        else None
+                    ),
+                )
         return None
 
     class EffectRuntime(_OpaqueHandle):
@@ -295,15 +373,35 @@ def _build_effect_system():
             ):
                 if operation is None:
                     operation = _MechanicalEffectOperation.AUDIT_ONLY
-                if not runtime.mechanical:
+                reasoning = runtime.reasoning_policy is not None
+                if not runtime.mechanical and not reasoning:
                     raise IngressAbort(FailureCode.UNKNOWN_OPERATION_TYPE)
                 try:
-                    payload = _snapshot(payload, limits=runtime.policy.payload_limits)
-                    small = ValueLimits(32, 16, runtime.policy.max_scalar_bytes)
+                    payload = _snapshot(
+                        payload,
+                        limits=(
+                            runtime.reasoning_policy.value_limits
+                            if reasoning
+                            else runtime.policy.payload_limits
+                        ),
+                    )
+                    small = (
+                        ValueLimits(128, 48, runtime.policy.max_scalar_bytes)
+                        if reasoning
+                        else ValueLimits(32, 16, runtime.policy.max_scalar_bytes)
+                    )
                     target = _snapshot(target, limits=small)
                     scope = _snapshot(scope, limits=small)
-                    contract = _effect_contract(
-                        runtime.policy, operation, target, payload, scope
+                    if reasoning and operation is not ReasoningOperation.PUBLISH:
+                        raise IngressAbort(FailureCode.UNKNOWN_OPERATION_TYPE)
+                    contract = (
+                        _reasoning_contract(
+                            runtime.reasoning_policy, target, payload, scope
+                        )
+                        if reasoning
+                        else _effect_contract(
+                            runtime.policy, operation, target, payload, scope
+                        )
                     )
                     effect = CanonicalEffectDescriptor(
                         CanonicalDescriptor("EffectType", (operation.value,)),
@@ -318,7 +416,13 @@ def _build_effect_system():
                         ),
                         contract.canonical_descriptor(),
                     )
-                    return freeze_effect(runtime.policy, effect)
+                    return freeze_effect(
+                        runtime.policy,
+                        effect,
+                        payload_limits=(
+                            runtime.reasoning_policy.value_limits if reasoning else None
+                        ),
+                    )
                 except (TypeError, ValueError, AttributeError) as error:
                     raise IngressAbort(FailureCode.INVALID_INPUT) from error
 
@@ -365,7 +469,13 @@ def _build_effect_system():
                         # Complete ID, history and independent return shell must
                         # fit BEFORE committing even the budget reservation.
                         clone_commit_view(
-                            runtime.policy, EffectCommitView(identity, frozen, charge)
+                            runtime.policy,
+                            EffectCommitView(identity, frozen, charge),
+                            payload_limits=(
+                                runtime.reasoning_policy.value_limits
+                                if runtime.reasoning_policy
+                                else None
+                            ),
                         )
                     except (TypeError, ValueError) as error:
                         raise IngressAbort(FailureCode.CAPACITY_ABORT) from error
@@ -373,7 +483,16 @@ def _build_effect_system():
                     return token, output
 
         def authorize_charge_and_commit(
-            self, authority, revision, ledger, reservation, prepared, *, cie=None
+            self,
+            authority,
+            revision,
+            ledger,
+            reservation,
+            prepared,
+            *,
+            cie=None,
+            work_runtime=None,
+            work_permit=None,
         ):
             if type(prepared) is not PreparedEffect:
                 raise IngressAbort(FailureCode.MISSING_BUDGET_CHARGE)
@@ -421,8 +540,54 @@ def _build_effect_system():
                             else nullcontext()
                         )
                         with guard:
+                            arena_plan = None
+                            if runtime.reasoning_policy is not None:
+                                from .reasoning.runtime import publication_from_output
+
+                                proven = _completed_reasoning_result(
+                                    work_runtime, work_permit, item, snapshot
+                                )
+                                publication = publication_from_output(proven)
+                                if publication != frozen.canonical_payload:
+                                    raise IngressAbort(
+                                        FailureCode.EFFECT_PAYLOAD_MISMATCH
+                                    )
+                                _, additions_data, terminal = publication.values
+                                from .arena import ArenaEntry
+
+                                additions = tuple(
+                                    ArenaEntry(*e.values) for e in additions_data
+                                )
+                                epoch, candidate = _prepare_reasoning_publication(
+                                    runtime.cie,
+                                    cie,
+                                    item,
+                                    snapshot,
+                                    core,
+                                    additions,
+                                    terminal,
+                                )
+                                arena_plan = (
+                                    epoch,
+                                    candidate,
+                                    terminal,
+                                    (
+                                        epoch.snapshot,
+                                        epoch.terminal,
+                                        epoch.last_binding,
+                                        item.cie_child,
+                                        item.nondelegated_children,
+                                    ),
+                                )
                             owner = owner_for(runtime, item) or _Owner(runtime)
-                            with owner.lock, registry_lock:
+                            retirement = (
+                                _retire_reasoning_epoch(
+                                    work_runtime, item, snapshot.cie, arena_plan[2]
+                                )
+                                if arena_plan is not None
+                                else nullcontext()
+                            )
+                            with retirement, owner.lock, registry_lock:
                                 if owner.closed:
                                     raise IngressAbort(
                                         FailureCode.OPERATIONAL_EFFECT_AUTHORITY_STALE
@@ -444,7 +609,15 @@ def _build_effect_system():
                                         FailureCode.MISSING_BUDGET_CHARGE
                                     )
                                 stored = EffectCommitView(identity, frozen, charge)
-                                output = clone_commit_view(runtime.policy, stored)
+                                output = clone_commit_view(
+                                    runtime.policy,
+                                    stored,
+                                    payload_limits=(
+                                        runtime.reasoning_policy.value_limits
+                                        if runtime.reasoning_policy
+                                        else None
+                                    ),
+                                )
                                 index = dict(owner.index)
                                 index[identity.canonical_bytes] = stored
                                 owners = dict(runtime.owners)
@@ -463,6 +636,14 @@ def _build_effect_system():
                                     item.budget.index = staged_budget
                                     runtime.owners = owners
                                     item.effect_owner = owner
+                                    if arena_plan is not None:
+                                        epoch, candidate, terminal, _ = arena_plan
+                                        epoch.snapshot = None if terminal else candidate
+                                        if terminal:
+                                            epoch.terminal = "PUBLISHED"
+                                            epoch.last_binding = candidate.binding
+                                            item.cie_child = None
+                                            item.nondelegated_children -= 1
                                     owner.index = index
                                 except BaseException:
                                     # Covers injected/asynchronous interruption
@@ -474,6 +655,15 @@ def _build_effect_system():
                                         runtime.owners,
                                         owner.index,
                                     ) = old
+                                    if arena_plan is not None:
+                                        epoch = arena_plan[0]
+                                        (
+                                            epoch.snapshot,
+                                            epoch.terminal,
+                                            epoch.last_binding,
+                                            item.cie_child,
+                                            item.nondelegated_children,
+                                        ) = arena_plan[3]
                                     raise
                                 return output
                 except IngressAbort as error:
@@ -498,7 +688,7 @@ def _build_effect_system():
                 with owner.lock, registry_lock:
                     return len(owner.index), runtime.policy.max_commits_per_owner
 
-    def bootstrap(parent, cie, policy, mechanical):
+    def bootstrap(parent, cie, policy, mechanical, reasoning_policy=None):
         if policy is None:
             policy = EffectPolicy()
         if (
@@ -508,6 +698,12 @@ def _build_effect_system():
         ):
             raise IngressAbort(FailureCode.INVALID_INPUT)
         frozen = EffectPolicy(*policy.canonical_descriptor().values)
+        if reasoning_policy is not None:
+            if mechanical or type(reasoning_policy) is not ReasoningPolicy:
+                raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
+            reasoning_policy = ReasoningPolicy(
+                *reasoning_policy.canonical_descriptor().values
+            )
         catalogue = CanonicalDescriptor(
             "Unit6EffectCatalogue",
             (
@@ -532,13 +728,29 @@ def _build_effect_system():
         ):
             if domain.effect_attached:
                 raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
+            if reasoning_policy is not None and (
+                cie_state.reasoning_policy is None
+                or reasoning_catalogue(reasoning_policy)
+                != reasoning_catalogue(cie_state.reasoning_policy)
+            ):
+                raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
             l3 = _snapshot(
                 CanonicalDescriptor(
                     "L3Unit6PolicyBinding", (cie_state.l3_policy, catalogue)
                 )
             )
+            if reasoning_policy is not None:
+                l3 = _snapshot(
+                    d(
+                        "L3Unit7Effects",
+                        l3,
+                        d("ReasoningEffectCatalogue", ReasoningOperation.PUBLISH.value),
+                    )
+                )
             handle = object.__new__(EffectRuntime)
-            runtime = _Runtime(parent, cie, frozen, mechanical)
+            runtime = _Runtime(
+                parent, cie, frozen, mechanical, reasoning_policy=reasoning_policy
+            )
             key = id(handle)
 
             @_deferred_cleanup
@@ -563,9 +775,9 @@ def _build_effect_system():
                 domain.effect_attached = True
             return handle
 
-    def create_effect_runtime(parent, cie, *, policy=None):
+    def create_effect_runtime(parent, cie, *, policy=None, reasoning_policy=None):
         """Production bootstrap: no concrete semantic effect catalogue yet."""
-        return bootstrap(parent, cie, policy, False)
+        return bootstrap(parent, cie, policy, False, reasoning_policy)
 
     def mechanical_harness(parent, cie, *, policy=None):
         """Private fixed test-only audit operations. No executor/handler argument."""

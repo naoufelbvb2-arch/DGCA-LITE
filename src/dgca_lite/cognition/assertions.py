@@ -47,6 +47,24 @@ class IngressAssertionView:
         canonical_identity_bytes(self.canonical_descriptor())
 
 
+def validate_ground_referent(node: CanonicalDescriptor, role: str) -> None:
+    """Closed typed referent shape shared by formal ingress and FAB closure."""
+    if (
+        type(node) is not CanonicalDescriptor
+        or type(node.kind) is not str
+        or node.kind != role
+        or type(node.values) is not tuple
+        or len(node.values) != 1
+    ):
+        raise TypeError("closed typed ground referent required")
+    value = node.values[0]
+    if not (
+        (type(value) is str and 0 < len(value) <= 256)
+        or (type(value) is int and 0 <= value < 2**63)
+    ):
+        raise ValueError("invalid bounded referent identity")
+
+
 def validate_constraint_content(content: ClaimContentID) -> None:
     """Validate the three Section-70 premise shapes; execute no constraint."""
     if (
@@ -60,7 +78,7 @@ def validate_constraint_content(content: ClaimContentID) -> None:
     if node.kind == "FormalNegation":
         arity, member_type = 1, ClaimContentID
     elif node.kind == "MutuallyExclusive":
-        arity, member_type = 2, ClaimContentID
+        arity, member_type = 2, CanonicalDescriptor
     elif node.kind == "SingleValued":
         arity, member_type = 1, CanonicalDescriptor
     else:
@@ -70,6 +88,9 @@ def validate_constraint_content(content: ClaimContentID) -> None:
         raise ValueError("invalid constraint premise arity")
     if any(type(member) is not member_type for member in node.values):
         raise TypeError("invalid constraint premise referent type")
+    if node.kind == "MutuallyExclusive":
+        for member in node.values:
+            validate_ground_referent(member, "state")
     canonical_identity_bytes(content)
     if node.kind == "MutuallyExclusive" and node.values[0] == node.values[1]:
         raise ValueError("self-exclusion is not a lawful constraint premise")
