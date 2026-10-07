@@ -1454,6 +1454,8 @@ ProtocolBindings
 
 The plan is immutable for the study.
 
+In v0, `MatchingSemantics` is exactly the prospectively frozen `ExactOutcomeClassification(ExpectedOutcome, ExplicitConflictOutcomes)` form defined in §41. No second executable generic causal matching family exists without a specification revision.
+
 `StoppingRule` MUST be outcome-independent: whether the study stops, continues, or exhausts its planned slots may depend only on the prospectively frozen schedule/resource rule, never on observed outcome values, favorable comparisons, or emerging effect direction.
 
 Every planned case slot has a terminal reporting state. All planned slots must be represented in the final study record as fulfilled, failed, unresolved, or lawfully unexecuted under the frozen outcome-independent stopping rule. A slot may not disappear from reporting because its outcome is inconvenient.
@@ -1504,6 +1506,60 @@ UNRESOLVED
 There is no generic `ABSENT` state that turns nonobservation into a negative fact.
 
 Outcome matching uses frozen typed semantics and exact structural identity as specified by the study.
+
+The sole executable generic causal matching family in v0 is:
+
+```text
+ExactOutcomeClassification(
+    ExpectedOutcome,
+    ExplicitConflictOutcomes
+)
+```
+
+`ExpectedOutcome` is one complete canonical typed outcome descriptor. `ExplicitConflictOutcomes` is a finite canonical ordered unique set of complete canonical typed outcome descriptors. All members must be lawful under the frozen `OutcomeSpec`, and `ExpectedOutcome` MUST NOT occur in `ExplicitConflictOutcomes`. The complete classifier is frozen in the prospective `CausalStudyPlan` before relevant observations. Hashes are indexes only; full canonical typed identity determines equality.
+
+For a lawful successfully measured outcome `O`, classification is exactly:
+
+```text
+if CanonicalIdentity(O) == CanonicalIdentity(ExpectedOutcome):
+    MATCH
+else if CanonicalIdentity(O) is an exact member of ExplicitConflictOutcomes:
+    CONFLICT
+else:
+    UNRESOLVED
+```
+
+Therefore:
+
+```text
+UnequalObservation != CausalConflict
+NotMatch != Conflict
+DifferentCanonicalOutcome != Conflict
+```
+
+`CONFLICT` requires the exact outcome to have been explicitly listed in the frozen prospective contrary-outcome contract. No lexical similarity, structural distance, semantic analogy, negation inference, probability, score, threshold, or learned relation participates.
+
+For `ExpectedOutcome = GroundState(X,A)`, `ExplicitConflictOutcomes = {}`, and `ObservedOutcome = GroundState(X,B)`, the classification is `UNRESOLVED`, not `CONFLICT`. If the prospectively frozen conflict set instead contains that exact `GroundState(X,B)`, the classification is `CONFLICT`. Adding it after observing it is forbidden retrospective adaptation and invalidates the study operation.
+
+A missing, failed, invalid, unavailable, or incomplete measurement supplies no outcome value to the classifier. Its causal comparison state is `UNRESOLVED`, while the planned case slot separately preserves its exact terminal reporting state, such as `FAILED`, `UNRESOLVED`, or `LAWFULLY_UNEXECUTED`, according to the frozen plan.
+
+```text
+MissingMeasurement != NegativeOutcome
+FailedMeasurement != Conflict
+NonObservation != Negation
+```
+
+No generic `ABSENT` outcome is introduced. Causal `CONFLICT` is defined only by the frozen causal `MatchingSemantics`. Reasoning constructs such as `FormalNegation`, `MutuallyExclusive`, `SingleValued`, `IncompatibilityView`, and `ConstraintClearanceView` do not automatically define causal case conflict:
+
+```text
+ReasoningIncompatibility != CausalCaseConflict
+```
+
+Matching bytes or logically incompatible assertions do not alter the causal classifier unless the exact outcome was already frozen in `ExplicitConflictOutcomes`.
+
+`ExpectedOutcome` and `ExplicitConflictOutcomes` may not change because of observed outcomes, favorable/unfavorable direction, missing cases, treatment branch, intermediate comparisons, or remaining budget. A changed classifier is a different study plan, not a revision of the active study.
+
+Only lawful `MATCH` and `CONFLICT` classifications may participate where the frozen `ComparisonPlan` explicitly requires resolved classified outcomes. `UNRESOLVED` remains unresolved and must not be silently coerced to either side. The frozen `ComparisonPlan` may explicitly specify how unresolved slots affect completion/reporting, but may not retrospectively substitute or ignore them based on observed results.
 
 ---
 
@@ -3583,6 +3639,14 @@ The implementation must prove at least:
 - replay/retransmission of one `TrustedCaseOccurrence` is idempotent and never independent evidence;
 - outcomes cannot change comparison selection;
 - missing case is not automatic negative outcome;
+- exact expected outcome yields `MATCH`;
+- unequal unlisted lawful outcome yields `UNRESOLVED`;
+- exact prospectively listed contrary outcome yields `CONFLICT`;
+- missing measurement yields `UNRESOLVED`;
+- failed measurement yields `UNRESOLVED`;
+- classifier cannot be altered after outcome observation;
+- Reasoning incompatibility cannot self-create causal `CONFLICT`;
+- `ExplicitConflictOutcomes` cannot overlap `ExpectedOutcome`;
 - intervention request is not application;
 - hypothetical treatment is not `do(X)`;
 - randomization requires protocol authority;
