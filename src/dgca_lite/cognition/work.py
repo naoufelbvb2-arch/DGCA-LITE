@@ -87,17 +87,21 @@ def _permit_identity(work):
 
 
 def _reasoning_source_bounds(
-    policy, capabilities, internal_results, prediction_views=()
+    policy, capabilities, internal_results, prediction_views=(), causal_views=()
 ):
     if (
         type(capabilities) is not tuple
         or type(internal_results) is not tuple
         or type(prediction_views) is not tuple
+        or type(causal_views) is not tuple
     ):
         raise IngressAbort(FailureCode.INVALID_INPUT)
     # Bound the entire seed group before inspecting either container's members.
     if (
-        len(capabilities) + len(internal_results) + len(prediction_views)
+        len(capabilities)
+        + len(internal_results)
+        + len(prediction_views)
+        + len(causal_views)
         > policy.max_sources
     ):
         raise IngressAbort(FailureCode.CAPACITY_ABORT)
@@ -118,6 +122,7 @@ def _build_work_system():
         retired: bool = False
         reasoning_policy: object = None
         prediction_policy: object = None
+        causal_policy: object = None
 
     @dataclass(slots=True)
     class _Permit:
@@ -133,6 +138,7 @@ def _build_work_system():
         prediction: bool = False
         origin: object = None
         audit_identity: object = None
+        causal: bool = False
 
     @dataclass(slots=True)
     class _Owner:
@@ -145,6 +151,15 @@ def _build_work_system():
         def prediction_epoch_close(self, binding):
             with self.lock:
                 for record in self.index[1].values():
+                    if (
+                        record.causal
+                        and record.binding is not None
+                        and record.binding.values[2].cie == binding
+                    ):
+                        record.state = "RETIRED"
+                        record.work = record.image = record.binding = record.output = (
+                            record.origin
+                        ) = None
                     if (
                         record.prediction
                         and record.audit_identity is not None
@@ -308,6 +323,7 @@ def _build_work_system():
             source_capabilities=None,
             internal_results=(),
             prediction_views=(),
+            causal_views=(),
             discovery_permit=None,
         ):
             """One linearizable Core/Life/Ledger/Arena/Owner/Registry transaction."""
@@ -360,6 +376,7 @@ def _build_work_system():
                                 source_capabilities,
                                 internal_results,
                                 prediction_views,
+                                causal_views,
                             )
                             expected_sources = _reasoning_sources(
                                 domain.ingress, source_capabilities
@@ -372,6 +389,13 @@ def _build_work_system():
 
                             expected_sources += tuple(
                                 reasoning_view(v) for v in prediction_views
+                            )
+                            from .causality.adapters import (
+                                reasoning_view as causal_reasoning_view,
+                            )
+
+                            expected_sources += tuple(
+                                causal_reasoning_view(v) for v in causal_views
                             )
                         discovered = None
                         if (
@@ -474,6 +498,8 @@ def _build_work_system():
                 check_runtime(self, runtime)
                 if record.prediction:
                     return prediction_execute(self, runtime, record, work)
+                if record.causal:
+                    return causal_execute(runtime, record, work)
                 with (
                     _pinned_cie_parent(
                         runtime.parent, record.authority, record.revision
@@ -741,6 +767,7 @@ def _build_work_system():
         capabilities,
         internal_results=(),
         prediction_views=(),
+        causal_views=(),
     ):
         with (
             access(handle, "RUNTIME") as (runtime, _),
@@ -762,6 +789,7 @@ def _build_work_system():
                     capabilities,
                     internal_results,
                     prediction_views,
+                    causal_views,
                 )
                 sources = _reasoning_sources(domain.ingress, capabilities)
                 from .reasoning.assertions import internal_retrieval_view
@@ -773,6 +801,9 @@ def _build_work_system():
                 from .prediction.adapters import reasoning_view
 
                 sources += tuple(reasoning_view(v) for v in prediction_views)
+                from .causality.adapters import reasoning_view as causal_reasoning_view
+
+                sources += tuple(causal_reasoning_view(v) for v in causal_views)
                 return CanonicalDescriptor(
                     "ReasoningInput",
                     (
@@ -1232,6 +1263,209 @@ def _build_work_system():
             ):
                 raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
 
+    def attach_causal(handle, parent, cie, policy):
+        from .causality.contracts import CausalityPolicy
+
+        with access(handle, "RUNTIME") as (runtime, _):
+            if (
+                runtime.parent is not parent
+                or runtime.cie is not cie
+                or runtime.causal_policy is not None
+                or type(policy) is not CausalityPolicy
+            ):
+                raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
+            runtime.causal_policy = policy
+
+    def causal_prepare(
+        handle,
+        item,
+        revision,
+        study,
+        operation,
+        ordinal,
+        snapshot,
+        data,
+        charge,
+        staged_budget,
+        pending_key,
+        cie,
+    ):
+        from .causality.contracts import contract
+        from .effects import _before_effect_publish, _validate_causal_study
+
+        _validate_causal_study(study, handle)
+        compiled = contract(operation, ordinal)
+        if (
+            compiled.effect_class is not WorkEffectClass.PURE_COMPUTE
+            or charge.work_class != compiled.work_class
+            or charge.source_kind is not BudgetSourceKind.CAUSAL_STUDY_ESCROW
+        ):
+            raise IngressAbort(FailureCode.BUDGET_WORKCLASS_MISMATCH)
+        with access(handle, "RUNTIME") as (runtime, _):
+            if runtime.causal_policy is None:
+                raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
+            data = _snapshot(data)
+            frame = CanonicalDescriptor(
+                "CausalPureWork", (compiled.canonical_descriptor(), data)
+            )
+            if len(canonical_identity_bytes(frame)) > 262144:
+                raise IngressAbort(FailureCode.CAPACITY_ABORT)
+            owner = item.work_owner or _Owner(runtime)
+            binding = CanonicalDescriptor(
+                "CausalWorkPermitBinding",
+                (
+                    study.identity,
+                    study.revision,
+                    snapshot,
+                    charge.canonical_descriptor(),
+                    operation.value,
+                    ordinal,
+                ),
+            )
+            token = object.__new__(WorkExecutionPermit)
+            record = _Permit(
+                token,
+                owner,
+                item.authority,
+                revision,
+                frame,
+                canonical_identity_bytes(frame),
+                binding,
+                causal=True,
+                audit_identity=binding,
+            )
+            pending = {**study.pending, pending_key: (token, frame, snapshot, cie)}
+            with owner.lock, registry_lock:
+                sequence, records = owner.index
+                staged = dict(records)
+                staged[id(token)] = record
+                registered = (
+                    ref(token),
+                    runtime,
+                    "PERMIT",
+                    WorkExecutionPermit,
+                    record,
+                )
+                staged_index = (sequence + 1, staged)
+                old = owner.index
+                old_work_owner, old_runtime_owner = (
+                    item.work_owner,
+                    runtime.owners.get(item.image),
+                )
+                old_budget, old_pending = item.budget.index, study.pending
+                try:
+                    _before_effect_publish()
+                    # The genuine study was validated before this registry
+                    # barrier and is pinned by the actual parent lifecycle.
+                    # Never take the distinct effect registry at equal rank 5.
+                    if (
+                        owner.closing
+                        or study.state != "ACTIVE"
+                        or study.revision != binding.values[1]
+                    ):
+                        raise IngressAbort(FailureCode.OWNER_AUTHORITY_STALE)
+                    handles[id(token)] = registered
+                    owner.index = staged_index
+                    item.work_owner = owner
+                    runtime.owners[item.image] = owner
+                    study.pending = pending
+                    item.budget.index = staged_budget
+                except BaseException:
+                    handles.pop(id(token), None)
+                    owner.index = old
+                    item.work_owner, item.budget.index, study.pending = (
+                        old_work_owner,
+                        old_budget,
+                        old_pending,
+                    )
+                    if old_runtime_owner is None:
+                        runtime.owners.pop(item.image, None)
+                    else:
+                        runtime.owners[item.image] = old_runtime_owner
+                    raise
+            return token, frame
+
+    def causal_execute(runtime, record, frame):
+        from .causality.contracts import CausalOperation
+        from .causality.results import compute
+
+        with (
+            _pinned_cie_parent(runtime.parent, record.authority, record.revision),
+            record.owner.lock,
+        ):
+            if (
+                record.owner.closing
+                or record.state != "ISSUED"
+                or canonical_identity_bytes(frame) != record.image
+            ):
+                raise IngressAbort(FailureCode.OWNER_AUTHORITY_STALE)
+            data = _snapshot(frame)
+            binding = _snapshot(record.binding)
+            record.state = "RUNNING"
+        try:
+            result = compute(CausalOperation(data.values[0].values[0]), data.values[1])
+            returned = PureWorkResultView(binding, _snapshot(result))
+            private = PureWorkResultView(_snapshot(binding), _snapshot(result))
+        except BaseException:
+            with _pinned_cie_parent(runtime.parent), record.owner.lock:
+                record.state = "RETIRED"
+                record.work = record.image = record.output = None
+            raise
+        with _pinned_cie_parent(runtime.parent), record.owner.lock:
+            if record.owner.closing or record.state == "RETIRED":
+                raise IngressAbort(FailureCode.OWNER_AUTHORITY_STALE)
+            record.state, record.output = "DONE", private
+        return returned
+
+    def causal_completed(handle, permit, study, operation, ordinal, snapshot):
+        from .effects import _validate_causal_study
+
+        _validate_causal_study(study, handle)
+        with (
+            access(handle, "RUNTIME") as (runtime, _),
+            access(permit, "PERMIT") as (own, record),
+            record.owner.lock,
+        ):
+            if (
+                own is not runtime
+                or not record.causal
+                or record.state != "DONE"
+                or record.binding.values[:3]
+                != (study.identity, study.revision, snapshot)
+                or record.binding.values[4:] != (operation.value, ordinal)
+            ):
+                raise IngressAbort(FailureCode.OWNER_AUTHORITY_STALE)
+            return _snapshot(record.output.output)
+
+    def causal_discard(handle, permit):
+        with (
+            access(handle, "RUNTIME") as (runtime, _),
+            access(permit, "PERMIT") as (own, record),
+            record.owner.lock,
+            registry_lock,
+        ):
+            if own is not runtime or not record.causal:
+                raise IngressAbort(FailureCode.OWNER_AUTHORITY_STALE)
+            record.state = "RETIRED"
+            record.work = record.image = record.binding = record.output = None
+            handles.pop(id(permit), None)
+            sequence, records = record.owner.index
+            record.owner.index = (
+                sequence,
+                {k: v for k, v in records.items() if k != id(permit)},
+            )
+
+    def causal_charge(handle, permit):
+        with (
+            access(handle, "RUNTIME") as (runtime, _),
+            access(permit, "PERMIT") as (own, record),
+            record.owner.lock,
+        ):
+            if own is not runtime or not record.causal or record.binding is None:
+                raise IngressAbort(FailureCode.MISSING_BUDGET_CHARGE)
+            source, *values = _snapshot(record.binding.values[3]).values
+            return BudgetChargeView(*values, source_kind=source)
+
     return (
         WorkRuntime,
         create_work_runtime,
@@ -1245,6 +1479,11 @@ def _build_work_system():
         prediction_audit,
         retire_forecast_work,
         validate_prediction_attachment,
+        attach_causal,
+        causal_prepare,
+        causal_completed,
+        causal_discard,
+        causal_charge,
     )
 
 
@@ -1261,5 +1500,10 @@ def _build_work_system():
     _prediction_audit_binding,
     _retire_forecast_work,
     _validate_prediction_attachment,
+    _attach_causal_work,
+    _causal_prepare,
+    _completed_causal_result,
+    _discard_causal_permit,
+    _causal_permit_charge,
 ) = _build_work_system()
 del _build_work_system

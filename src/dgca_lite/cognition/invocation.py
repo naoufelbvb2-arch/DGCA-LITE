@@ -154,6 +154,16 @@ def _build_invocation_system():
         forecast: bool = True
 
     @dataclass(slots=True)
+    class _CausalPool:
+        # A CHILD reservation in the SAME parent ledger, not a delegated pool
+        # or another accounting ledger. Tokens never leave trusted dispatch.
+        identity: CanonicalDescriptor
+        budget: _Budget
+        tokens: tuple
+        work_classes: tuple
+        source_kind: object = BudgetSourceKind.CAUSAL_STUDY_ESCROW
+
+    @dataclass(slots=True)
     class _Invocation:
         authority: InvocationAuthority
         ledger: object
@@ -367,7 +377,7 @@ def _build_invocation_system():
             source_kind=(
                 BudgetSourceKind.FORECAST_ESCROW
                 if getattr(item, "forecast", False)
-                else BudgetSourceKind.INVOCATION_GENERAL
+                else getattr(item, "source_kind", BudgetSourceKind.INVOCATION_GENERAL)
             ),
         )
         staged = list(units)
@@ -408,7 +418,7 @@ def _build_invocation_system():
             source_kind=(
                 BudgetSourceKind.FORECAST_ESCROW
                 if getattr(item, "forecast", False)
-                else BudgetSourceKind.INVOCATION_GENERAL
+                else getattr(item, "source_kind", BudgetSourceKind.INVOCATION_GENERAL)
             ),
         )
 
@@ -946,6 +956,69 @@ def _build_invocation_system():
         ) != canonical_identity_bytes(charge.canonical_descriptor()):
             raise IngressAbort(FailureCode.MISSING_BUDGET_CHARGE)
 
+    def prepare_causal_reservation(item, work_classes, study_identity):
+        if type(work_classes) is not tuple or not 1 <= len(work_classes) <= 255:
+            raise IngressAbort(FailureCode.CAPACITY_ABORT)
+        # A prospective private index shell only; publication remains a single
+        # pointer swap in the existing parent budget at the Unit-6 effect gate.
+        identity = CanonicalDescriptor("CausalStudyEscrowIdentity", (study_identity,))
+        prospective = _CausalPool(
+            identity,
+            _Budget(lock=item.budget.lock, index=item.budget.index),
+            (),
+            work_classes,
+        )
+        tokens = []
+        for work_class in work_classes:
+            token, _, staged = prepare_reservation(prospective, 1, work_class)
+            prospective.budget.index = staged
+            tokens.append(token)
+        pool = _CausalPool(identity, item.budget, tuple(tokens), work_classes)
+        return pool, prospective.budget.index
+
+    def prepare_causal_consumption(pool, work_class):
+        if type(pool) is not _CausalPool or type(work_class) is not CanonicalDescriptor:
+            raise IngressAbort(FailureCode.MISSING_BUDGET_CHARGE)
+        if work_class not in pool.work_classes:
+            raise IngressAbort(FailureCode.BUDGET_WORKCLASS_MISMATCH)
+        ordinal = pool.work_classes.index(work_class)
+        token = pool.tokens[ordinal]
+        record = reservation_for(pool, token)
+        return prepare_consumption(pool, token, record.units[0], work_class)
+
+    def validate_causal_charge(pool, work_class, charge):
+        if type(pool) is not _CausalPool or work_class not in pool.work_classes:
+            raise IngressAbort(FailureCode.MISSING_BUDGET_CHARGE)
+        token = pool.tokens[pool.work_classes.index(work_class)]
+        record = reservation_for(pool, token)
+        ordinal = record.units[0]
+        if pool.budget.index[0][ordinal].state != "CONSUMED":
+            raise IngressAbort(FailureCode.MISSING_BUDGET_CHARGE)
+        actual = inspect_charge(pool, token, ordinal, work_class)
+        if (
+            type(charge) is not BudgetChargeView
+            or actual.canonical_descriptor() != charge.canonical_descriptor()
+        ):
+            raise IngressAbort(FailureCode.MISSING_BUDGET_CHARGE)
+
+    def causal_retirement(pool):
+        if type(pool) is not _CausalPool:
+            raise IngressAbort(FailureCode.MISSING_BUDGET_CHARGE)
+        units, records, sequence = pool.budget.index
+        selected = {
+            i for token in pool.tokens for i in reservation_for(pool, token).units
+        }
+        return (
+            tuple(
+                _Unit("RETIRED", unit.reservation)
+                if index in selected and unit.state == "RESERVED"
+                else unit
+                for index, unit in enumerate(units)
+            ),
+            records,
+            sequence,
+        )
+
     return (
         InvocationRuntime,
         InvocationBudgetLedger,
@@ -960,6 +1033,10 @@ def _build_invocation_system():
         prepare_forecast_consumption,
         forecast_retirement,
         validate_forecast_charge,
+        prepare_causal_reservation,
+        prepare_causal_consumption,
+        validate_causal_charge,
+        causal_retirement,
     )
 
 
@@ -977,5 +1054,9 @@ def _build_invocation_system():
     _prepare_forecast_consumption,
     _forecast_retirement,
     _validate_forecast_charge,
+    _prepare_causal_reservation,
+    _prepare_causal_consumption,
+    _validate_causal_charge,
+    _causal_retirement,
 ) = _build_invocation_system()
 del _build_invocation_system

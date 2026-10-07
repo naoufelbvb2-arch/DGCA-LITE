@@ -1054,6 +1054,19 @@ def _build_authority_system():
         ):
             raise IngressAbort(FailureCode.INVALID_FORMAL_AUTHORITY)
 
+    @contextmanager
+    def pinned_causal_domain_root(issuer, ingress):
+        """Unit-9 trusted bootstrap only. A cognitive runtime/read facet cannot
+        create a physical-domain issuer. Require the genuine current Unit-2 root
+        for this EXACT Invocation ingress/Core and pin its actual Core barrier.
+        No writable Core or issuer state crosses the boundary.
+        """
+        with pinned_adapter(issuer, "ISSUER") as state:
+            actual = state_for(ingress, "INVOCATION_CAUSE")
+            if actual is not state:
+                raise IngressAbort(FailureCode.INVALID_FORMAL_AUTHORITY)
+            yield
+
     return (
         TrustedIngressIssuer,
         FormalReasoningIngress,
@@ -1067,6 +1080,7 @@ def _build_authority_system():
         prediction_core,
         attach_prediction,
         validate_prediction_reader,
+        pinned_causal_domain_root,
     )
 
 
@@ -1083,5 +1097,6 @@ def _build_authority_system():
     _pinned_prediction_core,
     _attach_prediction,
     _validate_prediction_reader,
+    _pinned_causal_domain_root,
 ) = _build_authority_system()
 del _build_authority_system

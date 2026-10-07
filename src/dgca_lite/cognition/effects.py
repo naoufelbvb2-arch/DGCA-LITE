@@ -185,6 +185,7 @@ def _build_effect_system():
         reasoning_policy: object = None
         prediction_policy: object = None
         forecasts: dict = field(default_factory=dict)
+        causal_system: object = None
 
     @dataclass(slots=True)
     class _Owner:
@@ -193,8 +194,13 @@ def _build_effect_system():
         index: dict = field(default_factory=dict)
         closed: bool = False
         seal_index: dict = field(default_factory=dict)
+        causal_children: tuple = ()
 
         def parent_close(self):
+            # Nondelegated children retire their SAME-parent ledger reservation
+            # before taking rank 4. Never acquire a ledger from below owner state.
+            for study in self.causal_children:
+                study.parent_close()
             with self.lock:
                 # Preserve committed historical effects, NEVER new authority.
                 self.closed = True
@@ -1599,6 +1605,118 @@ def _build_effect_system():
         """Private fixed test-only audit operations. No executor/handler argument."""
         return bootstrap(parent, cie, policy, True)
 
+    def attach_causality(handle, work, policy):
+        from .causality.contracts import CausalityPolicy, CausalOperation, contract
+        from .causality.runtime import _CausalSystem
+        from .work import _attach_causal_work
+
+        if type(policy) is not CausalityPolicy:
+            raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
+        # Public policy/value descriptors never alias operational authority bounds.
+        policy = CausalityPolicy(*_snapshot(policy.canonical_descriptor()).values)
+        with (
+            access(handle) as runtime,
+            _pinned_cie_parent(runtime.parent),
+            _pinned_effect_context(runtime.cie, runtime.parent) as context,
+        ):
+            if context.opened or runtime.causal_system is not None:
+                raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
+            l3 = _snapshot(
+                d(
+                    "L3Unit9Causality",
+                    context.l3_policy,
+                    policy.canonical_descriptor(),
+                    tuple(
+                        contract(op).canonical_descriptor() for op in CausalOperation
+                    ),
+                )
+            )
+            system = _CausalSystem(
+                runtime, work, policy, handles, registry_lock, _Owner
+            )
+            _attach_causal_work(work, runtime.parent, runtime.cie, policy)
+            runtime.causal_system = system
+            context.l3_policy = l3
+
+    def causal_call(handle, operation, *args):
+        from .causality.runtime import _CausalSystem
+
+        allowed = (
+            "new_domain",
+            "open_study",
+            "request_case",
+            "case_input",
+            "prepare_compute",
+            "publish_case",
+            "open_rce",
+            "admit_bundle",
+            "comparison_input",
+            "publish_comparison",
+            "finish_replay_study",
+            "check_completed",
+            "abort_study",
+            "registry_status",
+        )
+        with access(handle) as runtime:
+            if (
+                type(operation) is not str
+                or operation not in allowed
+                or type(runtime.causal_system) is not _CausalSystem
+            ):
+                raise IngressAbort(FailureCode.UNKNOWN_OPERATION_TYPE)
+            positions = {
+                "open_study": 3,
+                "request_case": 3,
+                "case_input": 3,
+                "prepare_compute": 4,
+                "publish_case": 3,
+                "open_rce": 3,
+                "admit_bundle": 3,
+                "comparison_input": 3,
+                "publish_comparison": 3,
+                "finish_replay_study": 3,
+                "check_completed": 0,
+                "abort_study": 3,
+            }
+            if operation in positions:
+                with runtime.causal_system.pinned_source(args[positions[operation]]):
+                    return getattr(runtime.causal_system, operation)(*args)
+            return getattr(runtime.causal_system, operation)(*args)
+
+    def causal_root(token, operation, *args):
+        from .causality.runtime import _CausalSystem
+
+        with registry_lock:
+            entry = handles.get(id(token))
+            if (
+                entry is None
+                or len(entry) != 6
+                or entry[0]() is not token
+                or entry[2] != "CAUSAL"
+            ):
+                raise IngressAbort(FailureCode.INVALID_FORMAL_AUTHORITY)
+            runtime = entry[1]
+            owner = runtime.owner_ref()
+            if (
+                owner is None
+                or runtime.retired
+                or type(runtime.causal_system) is not _CausalSystem
+            ):
+                raise IngressAbort(FailureCode.OWNER_AUTHORITY_STALE)
+        return runtime.causal_system.root_call(token, operation, *args)
+
+    def validate_causal_study(study, work):
+        from .causality.runtime import _Study
+
+        if type(study) is not _Study or study.system.work is not work:
+            raise IngressAbort(FailureCode.INVALID_FORMAL_AUTHORITY)
+        actual = study.system.study(study.token)
+        if (
+            actual is not study
+            or actual.system.runtime.causal_system is not study.system
+        ):
+            raise IngressAbort(FailureCode.INVALID_FORMAL_AUTHORITY)
+
     return (
         EffectRuntime,
         create_effect_runtime,
@@ -1607,6 +1725,11 @@ def _build_effect_system():
         validate_forecast,
         retire_environment,
         validate_attachment,
+        attach_causality,
+        causal_call,
+        causal_root,
+        validate_causal_study,
+        environment,
     )
 
 
@@ -1618,5 +1741,10 @@ def _build_effect_system():
     _validate_forecast_record,
     _retire_prediction_environment,
     _validate_prediction_attachment,
+    _attach_causality,
+    _causal_call,
+    _causal_root,
+    _validate_causal_study,
+    _causal_environment,
 ) = _build_effect_system()
 del _build_effect_system

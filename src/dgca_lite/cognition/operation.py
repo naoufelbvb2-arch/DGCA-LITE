@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .budget import BudgetChargeView
+from .causality.contracts import CausalOperation
 from .effect_types import _MechanicalEffectOperation
 from .identity import CanonicalDescriptor, SnapshotBinding
 from .ingress import _snapshot
@@ -47,6 +48,7 @@ _MEMBERS = tuple(
         _MechanicalEffectOperation,
         ReasoningOperation,
         PredictionOperation,
+        CausalOperation,
         BudgetClass,
         AuthorityRequirement,
         PublicationPolicy,
@@ -137,6 +139,7 @@ class OperationContract:
         | _MechanicalEffectOperation
         | ReasoningOperation
         | PredictionOperation
+        | CausalOperation
     )
     budget_class: BudgetClass
     effect_class: WorkEffectClass
@@ -171,7 +174,11 @@ class OperationContract:
                         else (
                             PredictionOperation
                             if type(self.operation_type) is PredictionOperation
-                            else OperationType
+                            else (
+                                CausalOperation
+                                if type(self.operation_type) is CausalOperation
+                                else OperationType
+                            )
                         )
                     ),
                 ),

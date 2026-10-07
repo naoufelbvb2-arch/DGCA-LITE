@@ -42,6 +42,7 @@ def validate(content, *, allowed_referents=None):
         "Assign": (CanonicalDescriptor,) * 3,
         "InternalRetrievalStatement": (bytes,),
         "PredictionOutcomeStatement": (bytes,),
+        "CausalResultStatement": (bytes,),
         "ObservedCoreFrontier": (tuple, tuple),
     }
 
@@ -84,7 +85,7 @@ def validate(content, *, allowed_referents=None):
             if node.kind == "InternalRetrievalStatement" and len(node.values[0]) > 8192:
                 raise ValueError("bounded retrieval literal required")
             if (
-                node.kind == "PredictionOutcomeStatement"
+                node.kind in ("PredictionOutcomeStatement", "CausalResultStatement")
                 and not 0 < len(node.values[0]) <= 65536
             ):
                 raise ValueError("bounded typed prediction literal required")

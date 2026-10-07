@@ -224,13 +224,21 @@ class EffectCommitView:
             CanonicalDescriptor("EffectType", ("PREDICTION_SEAL_AND_DELEGATE",)),
             CanonicalDescriptor("EffectType", ("PREDICTION_EVALUATE_AND_RECORD",)),
         )
-        if reasoning or prediction:
+        from .causality.contracts import CausalOperation
+
+        causal = self.effect.effect_type in tuple(
+            CanonicalDescriptor("EffectType", (operation.value,))
+            for operation in CausalOperation
+        )
+        if reasoning or prediction or causal:
             # The complete effect is already present in commit_id. Avoid a
             # second copy of a bounded reasoning publication's proof graph.
             return CanonicalDescriptor(
                 "ReasoningEffectCommitView"
                 if reasoning
-                else "PredictionEffectCommitView",
+                else "PredictionEffectCommitView"
+                if prediction
+                else "CausalEffectCommitView",
                 (
                     self.commit_id.canonical_descriptor(),
                     self.charge.canonical_descriptor(),
