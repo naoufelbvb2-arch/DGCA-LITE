@@ -12,6 +12,7 @@ from .effect_types import _MechanicalEffectOperation
 from .identity import CanonicalDescriptor, SnapshotBinding
 from .ingress import _snapshot
 from .policy import ValueLimits
+from .prediction.contracts import PredictionOperation
 from .reasoning.schemas import ReasoningOperation, ReasoningPolicy, catalogue
 from .serialization import canonical_identity_bytes
 from .types import WorkEffectClass
@@ -31,6 +32,7 @@ class AuthorityRequirement(Enum):
     ENVIRONMENT_CURRENT = "ENVIRONMENT_CURRENT"
     CIE_CURRENT = "CIE_CURRENT"
     SNAPSHOT_CURRENT = "SNAPSHOT_CURRENT"
+    FORECAST_CURRENT = "FORECAST_CURRENT"
 
 
 class PublicationPolicy(Enum):
@@ -44,6 +46,7 @@ _MEMBERS = tuple(
         OperationType,
         _MechanicalEffectOperation,
         ReasoningOperation,
+        PredictionOperation,
         BudgetClass,
         AuthorityRequirement,
         PublicationPolicy,
@@ -129,7 +132,12 @@ class ResourceEnvelope:
 
 @dataclass(frozen=True, slots=True)
 class OperationContract:
-    operation_type: OperationType | _MechanicalEffectOperation | ReasoningOperation
+    operation_type: (
+        OperationType
+        | _MechanicalEffectOperation
+        | ReasoningOperation
+        | PredictionOperation
+    )
     budget_class: BudgetClass
     effect_class: WorkEffectClass
     authority_requirements: tuple[AuthorityRequirement, ...]
@@ -160,7 +168,11 @@ class OperationContract:
                     else (
                         ReasoningOperation
                         if type(self.operation_type) is ReasoningOperation
-                        else OperationType
+                        else (
+                            PredictionOperation
+                            if type(self.operation_type) is PredictionOperation
+                            else OperationType
+                        )
                     ),
                 ),
                 _label(self.budget_class, BudgetClass),

@@ -24,6 +24,7 @@ class BudgetLedgerView:
     reserved: int
     consumed: int
     retired: int
+    delegated: int = 0
 
     def canonical_descriptor(self) -> CanonicalDescriptor:
         counts = (
@@ -37,8 +38,15 @@ class BudgetLedgerView:
             raise TypeError("invalid budget owner")
         if any(type(value) is not int or value < 0 for value in counts):
             raise ValueError("budget counts must be exact nonnegative integers")
-        if self.initial != sum(counts[1:]):
+        if type(self.delegated) is not int or self.delegated < 0:
+            raise ValueError("invalid delegated count")
+        if self.initial != sum(counts[1:]) + self.delegated:
             raise ValueError("budget conservation violated")
+        if self.delegated:
+            return CanonicalDescriptor(
+                "DelegatedInvocationBudgetLedgerView",
+                (self.owner_identity,) + counts + (self.delegated,),
+            )
         return CanonicalDescriptor(
             "InvocationBudgetLedgerView", (self.owner_identity,) + counts
         )
@@ -55,6 +63,7 @@ class BudgetChargeView:
     reservation_identity: CanonicalDescriptor
     unit_identity: CanonicalDescriptor
     work_class: CanonicalDescriptor
+    source_kind: BudgetSourceKind = BudgetSourceKind.INVOCATION_GENERAL
 
     def canonical_descriptor(self) -> CanonicalDescriptor:
         fields = (
@@ -65,9 +74,11 @@ class BudgetChargeView:
         )
         if any(type(value) is not CanonicalDescriptor for value in fields):
             raise TypeError("invalid charge identity")
+        if type(self.source_kind) is not BudgetSourceKind:
+            raise TypeError("exact charge source required")
         return CanonicalDescriptor(
             "BudgetChargeBinding",
-            (BudgetSourceKind.INVOCATION_GENERAL,) + fields,
+            (self.source_kind,) + fields,
         )
 
     def __post_init__(self) -> None:

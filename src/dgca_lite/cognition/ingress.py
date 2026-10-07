@@ -1,16 +1,17 @@
-"""Trusted composition-root issuance and Unit-2-only ingress boundaries.
+"""Trusted composition-root issuance and closed ingress/event boundaries.
 
 create_trusted_ingress_boundary is a trusted external bootstrap, not a cognitive
 API. Its returned issuer must stay with the trusted source/controller. Pass
 only the narrower adapters and explicitly issued handles to consumers. A new
 formal authorization is an explicit source action, never text interpretation.
 
-All external Core transitions for an attached Core must run under the issuer's
-core_transition barrier, including calls to the existing TrustedCoreAdapter.
-This module never dispatches or performs a Core transition itself. Invocation,
-CIE, charge ownership and effect dispatch are intentionally not implemented.
-These external-boundary primitives assert no charge exemption. Future charged
-invocation integration must supply its canonical owner/charge contracts.
+External Core transitions use the issuer's complete Core barrier. Without
+Prediction, core_transition permits the existing TrustedCoreAdapter path.
+With Prediction attached, process_core_event dispatches that same normal path
+exactly once and delivers its genuine occurrence to the fixed forecast handler
+before releasing the barrier. Cognitive operators receive neither this issuer
+nor a live Core/receipt. Invocation, CIE, budget and effect machinery remain in
+their existing modules; this ingress boundary grants no semantic work exemption.
 """
 
 from __future__ import annotations
@@ -133,6 +134,7 @@ def _build_authority_system():
     handles: dict[int, tuple[ReferenceType, object, str, type]] = {}
     domains: dict[int, tuple[ReferenceType, object]] = {}
     core_audits: tuple = ()
+    read_facets = {}
 
     @dataclass(slots=True)
     class _CoreAudit:
@@ -140,6 +142,8 @@ def _build_authority_system():
         barrier: object = field(default_factory=lambda: RankedBarrier(0))
         last_observation: tuple[int, int, int] = (-1, -1, -1)
         last_domain: object = None
+        prediction: object = None
+        continuity_revision: int = 0
 
     @dataclass(frozen=True, slots=True)
     class _Record:
@@ -172,6 +176,8 @@ def _build_authority_system():
         )
         adapters: tuple = ()
         owner_id: int = 0
+        prediction: object = None
+        active_prediction_event: object = None
 
         @property
         def occurrences(self) -> dict[bytes, _Record]:
@@ -485,6 +491,17 @@ def _build_authority_system():
             yield binding
 
     def remove_domain(state: _State) -> None:
+        if state.prediction is not None:
+            from .effects import _retire_prediction_environment
+
+            with state.barrier:
+                _retire_prediction_environment(state.prediction[0])
+                state.prediction = None
+                if (
+                    state.core_audit.prediction is not None
+                    and state.core_audit.prediction[0] is state
+                ):
+                    state.core_audit.prediction = None
         state.closed = True
         state.revision += 1
         state.index = ({}, {})
@@ -544,7 +561,54 @@ def _build_authority_system():
             state = state_for(self, "ISSUER")
             with state.barrier:
                 live(state)
+                if state.core_audit.prediction is not None:
+                    raise IngressAbort(
+                        FailureCode.INVALID_FORMAL_AUTHORITY,
+                        "Prediction requires the trusted process_core_event boundary",
+                    )
                 yield
+
+        def process_core_event(self, event, *, boundary=False, additional_evidence=()):
+            """Trusted composition-root event route; no operator/FDA can call it.
+
+            The genuine lower-layer receipt exists before forecast acquisition.
+            Delivery is synchronous under the same complete Core barrier, so
+            capture completion/thread order cannot reorder trusted occurrences.
+            """
+            from dgca_lite.memory.integration import TrustedCoreAdapter
+            from dgca_lite.model import HardBoundary
+
+            from .effects import _deliver_prediction_event
+
+            state = state_for(self, "ISSUER")
+            with state.barrier:
+                live(state)
+                if type(boundary) not in (bool, HardBoundary):
+                    raise IngressAbort(FailureCode.INVALID_INPUT)
+                present = (
+                    boundary.present if type(boundary) is HardBoundary else boundary
+                )
+                if type(present) is not bool:
+                    raise IngressAbort(FailureCode.INVALID_INPUT)
+                result = TrustedCoreAdapter.process_event(
+                    state.core,
+                    event,
+                    boundary=boundary,
+                    additional_evidence=additional_evidence,
+                )
+                if present:
+                    state.core_audit.continuity_revision += 1
+                outcomes = ()
+                if state.core_audit.prediction is not None:
+                    prediction_state, effects, work = state.core_audit.prediction
+                    prediction_state.active_prediction_event = (result.receipt, present)
+                    try:
+                        outcomes = _deliver_prediction_event(
+                            effects, work, result.receipt, present
+                        )
+                    finally:
+                        prediction_state.active_prediction_event = None
+                return result, outcomes
 
         @property
         def registry_status(self) -> tuple[int, int, int]:
@@ -729,6 +793,10 @@ def _build_authority_system():
             state = state_for(self, "ISSUER")
             with state.barrier:
                 live(state)
+                if state.prediction is not None:
+                    from .effects import _retire_prediction_environment
+
+                    _retire_prediction_environment(state.prediction[0])
                 state.revision += 1
                 # Retain bounded occurrence tombstones: no stale replay can reissue.
 
@@ -857,6 +925,135 @@ def _build_authority_system():
             output.append(view.canonical_descriptor())
         return tuple(output)
 
+    @dataclass(frozen=True, slots=True)
+    class _PredictionRead:
+        state: _State
+        receipt: object
+        binding: CoreStateBinding
+        occurrence: object
+        explicitly_empty: bool
+
+        @property
+        def runtime(self):
+            return self.state.runtime
+
+        @property
+        def revision(self):
+            return self.state.revision
+
+        @property
+        def continuity(self):
+            return self.state.core_audit.continuity_revision
+
+        def retrieve(self, config, cue):
+            from dgca_lite.memory.session import (
+                retrieve_after_core_event,
+                retrieve_internal,
+            )
+
+            validate_prediction_reader(self)
+            if self.receipt is None:
+                return retrieve_internal(self.state.core, dict(cue), config)
+            return retrieve_after_core_event(
+                self.state.core, self.receipt, dict(cue), config
+            )
+
+        def target_valid(self, descriptor):
+            from .prediction.targets import AtomicCarrier, target_from_data
+
+            validate_prediction_reader(self)
+            target = target_from_data(descriptor)
+            network = self.state.core.network
+            if type(target) is AtomicCarrier:
+                cell = network.cells.get(target.carrier_id)
+                return (
+                    cell is not None and cell.committed and cell.id == target.carrier_id
+                )
+            assembly = network.assemblies.get(target.target_assembly_id)
+            if assembly is None or assembly.id != target.target_assembly_id:
+                return False
+            if not set(target.pattern_cells) <= assembly.members:
+                return False
+            return all(
+                (cell := network.cells.get(cid)) is not None
+                and cell.committed
+                and cell.id == cid
+                for cid in target.pattern_cells
+            )
+
+    @contextmanager
+    def prediction_core(ingress, receipt=None, *, delivery=False, boundary=None):
+        """Private bounded read facet under existing Core barrier, never a worker argument."""
+        with pinned_adapter(ingress, "INVOCATION_CAUSE") as state:
+            if delivery and (
+                state.active_prediction_event is None
+                or state.active_prediction_event[0] is not receipt
+                or state.active_prediction_event[1] is not boundary
+            ):
+                raise IngressAbort(FailureCode.INVALID_FORMAL_AUTHORITY)
+            occurrence, empty = None, False
+            if receipt is not None:
+                if type(receipt) is not TrustedRetrievalReceipt:
+                    raise IngressAbort(FailureCode.INVALID_FORMAL_AUTHORITY)
+                try:
+                    version, tick, root, frontier, _ = validate_receipt(
+                        state.core,
+                        receipt,
+                        state.core.network.version,
+                        state.core.network.tick,
+                    )
+                except RetrievalAbort as error:
+                    raise IngressAbort(FailureCode.INVALID_FORMAL_AUTHORITY) from error
+                if state.core.temporal.next_root_id != root + 1:
+                    raise IngressAbort(FailureCode.ENVIRONMENT_STALE)
+                occurrence = CanonicalDescriptor(
+                    "TrustedCoreOccurrence", (version, tick, root)
+                )
+                empty = not frontier
+            with pinned_core_binding(ingress) as binding:
+                reader = _PredictionRead(state, receipt, binding, occurrence, empty)
+                with registry_lock:
+                    if len(read_facets) >= 4 * max_domains:
+                        raise IngressAbort(FailureCode.CAPACITY_ABORT)
+                    read_facets[id(reader)] = reader
+                try:
+                    yield reader
+                finally:
+                    with registry_lock:
+                        read_facets.pop(id(reader), None)
+
+    def attach_prediction(ingress, effects, work):
+        from .effects import EffectRuntime
+        from .work import WorkRuntime
+
+        if type(effects) is not EffectRuntime or type(work) is not WorkRuntime:
+            raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
+        with pinned_adapter(ingress, "INVOCATION_CAUSE") as state:
+            if state.prediction is not None or state.core_audit.prediction is not None:
+                raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
+            from .effects import _validate_prediction_attachment
+
+            _validate_prediction_attachment(effects, work, ingress)
+            state.prediction = (effects, work)
+            state.core_audit.prediction = (state, effects, work)
+
+    def validate_prediction_reader(reader):
+        with registry_lock:
+            if (
+                type(reader) is not _PredictionRead
+                or read_facets.get(id(reader)) is not reader
+            ):
+                raise IngressAbort(FailureCode.INVALID_FORMAL_AUTHORITY)
+        # This private read facet is created only inside the existing pinned
+        # Core gate, not from public RootView/receipt descriptor reconstruction.
+        state = reader.state
+        if (
+            state.closed
+            or state.prediction is None
+            or reader.binding.core_identity != state.runtime
+        ):
+            raise IngressAbort(FailureCode.INVALID_FORMAL_AUTHORITY)
+
     return (
         TrustedIngressIssuer,
         FormalReasoningIngress,
@@ -867,6 +1064,9 @@ def _build_authority_system():
         pinned_invocation_cause,
         pinned_core_binding,
         reasoning_sources,
+        prediction_core,
+        attach_prediction,
+        validate_prediction_reader,
     )
 
 
@@ -880,5 +1080,8 @@ def _build_authority_system():
     _pinned_invocation_cause,
     _pinned_core_binding,
     _reasoning_sources,
+    _pinned_prediction_core,
+    _attach_prediction,
+    _validate_prediction_reader,
 ) = _build_authority_system()
 del _build_authority_system

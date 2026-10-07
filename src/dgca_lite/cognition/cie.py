@@ -76,6 +76,7 @@ def _build_cie_system():
         work_attached: bool = False
         effect_attached: bool = False
         reasoning_policy: object = None
+        prediction_policy: object = None
 
     @dataclass(slots=True)
     class _Epoch:
@@ -92,6 +93,9 @@ def _build_cie_system():
 
         def finish(self, status):
             # Caller holds the Invocation lifecycle gate and then arena lock.
+            work_owner = self.invocation.work_owner
+            if work_owner is not None:
+                work_owner.prediction_epoch_close(self.binding)
             self.terminal = status
             self.last_binding = self.snapshot.binding
             self.snapshot = None

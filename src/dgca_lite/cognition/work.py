@@ -1,20 +1,25 @@
-"""Unit-5 atomic pure-work authorization. No effects or cognitive operators.
+"""Shared atomic pure-work authorization and fixed capability-free operators.
 
 Operational state is bounded by the nonrenewable invocation budget. The only
-worker is a compiled closed-value copy; no caller callable is ever dispatched.
-Audit/result descriptors are data, not authority. No publication API exists.
+workers are closed-value copy and compiled Reasoning/Prediction functions;
+no caller callable is dispatched. Results are data, never publication authority.
 """
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from weakref import ref
 
 from .authority import IngressAbort, _OpaqueHandle
 from .budget import BudgetChargeView
-from .cie import CIERuntime, _pinned_cie_work, _pinned_work_policy
+from .cie import (
+    CIERuntime,
+    _pinned_cie_work,
+    _pinned_effect_context,
+    _pinned_work_policy,
+)
 from .contracts import ControlPlaneOperation
 from .identity import CanonicalDescriptor, SnapshotBinding
-from .ingress import _reasoning_sources, _snapshot
+from .ingress import _pinned_prediction_core, _reasoning_sources, _snapshot
 from .invocation import (
     InvocationRuntime,
     _pinned_cie_parent,
@@ -36,7 +41,13 @@ from .operation import (
 )
 from .reasoning.schemas import ReasoningOperation, ReasoningPolicy
 from .serialization import canonical_identity_bytes
-from .types import BudgetSourceKind, FailureCode, InvocationState, WorkEffectClass
+from .types import (
+    BudgetSourceKind,
+    FailureCode,
+    ForecastStatus,
+    InvocationState,
+    WorkEffectClass,
+)
 
 
 class WorkExecutionPermit(_OpaqueHandle):
@@ -75,11 +86,20 @@ def _permit_identity(work):
     )
 
 
-def _reasoning_source_bounds(policy, capabilities, internal_results):
-    if type(capabilities) is not tuple or type(internal_results) is not tuple:
+def _reasoning_source_bounds(
+    policy, capabilities, internal_results, prediction_views=()
+):
+    if (
+        type(capabilities) is not tuple
+        or type(internal_results) is not tuple
+        or type(prediction_views) is not tuple
+    ):
         raise IngressAbort(FailureCode.INVALID_INPUT)
     # Bound the entire seed group before inspecting either container's members.
-    if len(capabilities) + len(internal_results) > policy.max_sources:
+    if (
+        len(capabilities) + len(internal_results) + len(prediction_views)
+        > policy.max_sources
+    ):
         raise IngressAbort(FailureCode.CAPACITY_ABORT)
 
 
@@ -97,6 +117,7 @@ def _build_work_system():
         owners: dict = field(default_factory=dict)
         retired: bool = False
         reasoning_policy: object = None
+        prediction_policy: object = None
 
     @dataclass(slots=True)
     class _Permit:
@@ -109,6 +130,9 @@ def _build_work_system():
         binding: object
         state: str = "ISSUED"
         output: object = None
+        prediction: bool = False
+        origin: object = None
+        audit_identity: object = None
 
     @dataclass(slots=True)
     class _Owner:
@@ -118,6 +142,20 @@ def _build_work_system():
         index: tuple = field(default_factory=lambda: (0, {}))
         closing: bool = False
 
+        def prediction_epoch_close(self, binding):
+            with self.lock:
+                for record in self.index[1].values():
+                    if (
+                        record.prediction
+                        and record.audit_identity is not None
+                        and record.audit_identity.kind == "PredictionWorkPermitBinding"
+                        and record.audit_identity.values[0].cie == binding
+                    ):
+                        record.state = "RETIRED"
+                        record.work = record.image = record.binding = record.output = (
+                            record.origin
+                        ) = None
+
         def parent_close(self):
             with self.lock:
                 self.closing = True
@@ -126,7 +164,9 @@ def _build_work_system():
                         record.state = "RETIRED"
                     # Running workers hold their already-frozen local input.
                     # Terminal registry never retains semantic work/audit data.
-                    record.work = record.image = record.binding = record.output = None
+                    record.work = record.image = record.binding = record.output = (
+                        record.origin
+                    ) = None
 
     @contextmanager
     def access(handle, role):
@@ -267,6 +307,7 @@ def _build_work_system():
             *,
             source_capabilities=None,
             internal_results=(),
+            prediction_views=(),
             discovery_permit=None,
         ):
             """One linearizable Core/Life/Ledger/Arena/Owner/Registry transaction."""
@@ -318,6 +359,7 @@ def _build_work_system():
                                 runtime.reasoning_policy,
                                 source_capabilities,
                                 internal_results,
+                                prediction_views,
                             )
                             expected_sources = _reasoning_sources(
                                 domain.ingress, source_capabilities
@@ -325,6 +367,11 @@ def _build_work_system():
                             expected_sources += tuple(
                                 internal_retrieval_view(v, frozen.snapshot_binding)
                                 for v in internal_results
+                            )
+                            from .prediction.adapters import reasoning_view
+
+                            expected_sources += tuple(
+                                reasoning_view(v) for v in prediction_views
                             )
                         discovered = None
                         if (
@@ -425,6 +472,8 @@ def _build_work_system():
         def execute(self, permit, work):
             with access(permit, "PERMIT") as (runtime, record):
                 check_runtime(self, runtime)
+                if record.prediction:
+                    return prediction_execute(self, runtime, record, work)
                 with (
                     _pinned_cie_parent(
                         runtime.parent, record.authority, record.revision
@@ -575,7 +624,9 @@ def _build_work_system():
                                 ) == canonical_identity_bytes(record.output.output)
                             raise IngressAbort(FailureCode.EXEMPTION_CONTRACT_VIOLATION)
 
-    def create_work_runtime(parent, cie, *, policy=None, reasoning_policy=None):
+    def create_work_runtime(
+        parent, cie, *, policy=None, reasoning_policy=None, prediction_policy=None
+    ):
         """Trusted composition-root installation, once and before the first CIE."""
         if policy is None:
             policy = WorkPolicy()
@@ -594,6 +645,18 @@ def _build_work_system():
                 *reasoning_policy.canonical_descriptor().values
             )
         catalogue = compiled_policy_descriptor(frozen_policy, reasoning_policy)
+        if prediction_policy is not None:
+            from .prediction.projection import PredictionPolicy
+
+            if type(prediction_policy) is not PredictionPolicy:
+                raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
+            prediction_policy = PredictionPolicy(
+                *prediction_policy.canonical_descriptor().values[:6]
+            )
+            catalogue = CanonicalDescriptor(
+                "Unit8WorkCatalogue",
+                (*catalogue.values, prediction_policy.canonical_descriptor()),
+            )
         with (
             _pinned_cie_parent(parent) as (domain, _, _),
             _pinned_work_policy(cie, parent) as cie_state,
@@ -607,7 +670,11 @@ def _build_work_system():
             )
             owner = object.__new__(WorkRuntime)
             runtime = _Runtime(
-                parent, cie, frozen_policy, reasoning_policy=reasoning_policy
+                parent,
+                cie,
+                frozen_policy,
+                reasoning_policy=reasoning_policy,
+                prediction_policy=prediction_policy,
             )
             key = id(owner)
 
@@ -633,6 +700,7 @@ def _build_work_system():
                 cie_state.l3_policy = l3
                 cie_state.work_attached = True
                 cie_state.reasoning_policy = reasoning_policy
+                cie_state.prediction_policy = prediction_policy
                 domain.work_attached = True
             return owner
 
@@ -672,6 +740,7 @@ def _build_work_system():
         snapshot,
         capabilities,
         internal_results=(),
+        prediction_views=(),
     ):
         with (
             access(handle, "RUNTIME") as (runtime, _),
@@ -689,7 +758,10 @@ def _build_work_system():
                 if snapshot.canonical_bytes != epoch.snapshot.canonical_bytes:
                     raise IngressAbort(FailureCode.CIE_STALE)
                 _reasoning_source_bounds(
-                    runtime.reasoning_policy, capabilities, internal_results
+                    runtime.reasoning_policy,
+                    capabilities,
+                    internal_results,
+                    prediction_views,
                 )
                 sources = _reasoning_sources(domain.ingress, capabilities)
                 from .reasoning.assertions import internal_retrieval_view
@@ -698,6 +770,9 @@ def _build_work_system():
                     internal_retrieval_view(v, snapshot.binding)
                     for v in internal_results
                 )
+                from .prediction.adapters import reasoning_view
+
+                sources += tuple(reasoning_view(v) for v in prediction_views)
                 return CanonicalDescriptor(
                     "ReasoningInput",
                     (
@@ -724,21 +799,33 @@ def _build_work_system():
                 raise IngressAbort(FailureCode.OWNER_AUTHORITY_STALE)
             with owner.lock:
                 records = tuple(
-                    (r, (r.state, r.work, r.image, r.binding, r.output))
+                    (r, (r.state, r.work, r.image, r.binding, r.output, r.origin))
                     for r in owner.index[1].values()
                     if r.work is not None
-                    and type(r.work.contract.operation_type) is ReasoningOperation
-                    and r.work.snapshot_binding.cie == binding
+                    and (
+                        (
+                            not r.prediction
+                            and type(r.work.contract.operation_type)
+                            is ReasoningOperation
+                            and r.work.snapshot_binding.cie == binding
+                        )
+                        or (
+                            r.prediction
+                            and r.audit_identity is not None
+                            and r.audit_identity.kind == "PredictionWorkPermitBinding"
+                            and r.audit_identity.values[0].cie == binding
+                        )
+                    )
                 )
                 for r, _ in records:
                     r.state = "RETIRED"
-                    r.work = r.image = r.binding = r.output = None
+                    r.work = r.image = r.binding = r.output = r.origin = None
             try:
                 yield
             except BaseException:
                 with owner.lock:
                     for r, old in records:
-                        r.state, r.work, r.image, r.binding, r.output = old
+                        r.state, r.work, r.image, r.binding, r.output, r.origin = old
                 raise
 
     def cleanup_epoch(handle, authority, binding):
@@ -750,6 +837,401 @@ def _build_work_system():
                 with retire_epoch(handle, item, binding):
                     pass
 
+    def prediction_record(
+        runtime, owner, authority, revision, operation, data, binding, origin
+    ):
+        """One exact permit in the existing Work/WEP registry, no second runtime."""
+        from .prediction.contracts import contract
+
+        phase = "PROJECT" if operation.value == "PREDICTION_PROJECT" else "CAPTURE"
+        offset = 0 if phase == "PROJECT" else binding.values[2]
+        compiled = contract(operation, phase, offset)
+        charge = binding.values[1] if phase == "PROJECT" else binding.values[3]
+        if charge.values[4] != compiled.work_class:
+            raise IngressAbort(FailureCode.BUDGET_WORKCLASS_MISMATCH)
+        frame = CanonicalDescriptor(
+            "PredictionPureWork",
+            (compiled.canonical_descriptor(), data, binding),
+        )
+        image = canonical_identity_bytes(frame)
+        if len(image) > 262144:
+            raise IngressAbort(FailureCode.CAPACITY_ABORT)
+        token = object.__new__(WorkExecutionPermit)
+        record = _Permit(
+            token,
+            owner,
+            authority,
+            revision,
+            frame,
+            image,
+            binding,
+            prediction=True,
+            origin=origin,
+            audit_identity=binding,
+        )
+        sequence, records = owner.index
+        staged = dict(records)
+        staged[id(token)] = record
+        registered = (ref(token), runtime, "PERMIT", WorkExecutionPermit, record)
+        with registry_lock:
+            old = owner.index
+            try:
+                handles[id(token)] = registered
+                owner.index = (sequence + 1, staged)
+            except BaseException:
+                handles.pop(id(token), None)
+                owner.index = old
+                raise
+        return token, frame
+
+    def prediction_execute(handle, runtime, record, work, *, already_pinned=False):
+        from .prediction.contracts import PredictionOperation, compute
+
+        guard = (
+            nullcontext
+            if already_pinned
+            else lambda: _pinned_cie_parent(runtime.parent)
+        )
+        with guard(), record.owner.lock:
+            if record.owner.closing or record.state != "ISSUED":
+                raise IngressAbort(FailureCode.OWNER_AUTHORITY_STALE)
+            if (
+                type(work) is not CanonicalDescriptor
+                or canonical_identity_bytes(work) != record.image
+            ):
+                raise IngressAbort(FailureCode.INVALID_INPUT)
+            frozen = _snapshot(work)
+            record.state = "RUNNING"
+        operation = PredictionOperation(frozen.values[0].values[0])
+        try:
+            output = compute(operation, frozen.values[1])
+            returned = PureWorkResultView(_snapshot(record.binding), _snapshot(output))
+            private = PureWorkResultView(_snapshot(record.binding), _snapshot(output))
+        except BaseException:
+            with guard(), record.owner.lock:
+                record.state = "RETIRED"
+                record.work = record.image = record.binding = record.output = (
+                    record.origin
+                ) = None
+            raise
+        with guard(), record.owner.lock:
+            if record.owner.closing or record.state == "RETIRED":
+                raise IngressAbort(FailureCode.OWNER_AUTHORITY_STALE)
+            record.state = "DONE"
+            record.output = private
+        return returned
+
+    def prediction_project(
+        handle, authority, revision, cie, ledger, snapshot, receipt, cue, claims
+    ):
+        from dgca_lite.memory.config import MemoryConfig
+        from dgca_lite.memory.types import FailureCode as L2Failure
+        from dgca_lite.memory.types import RetrievalFailure
+
+        from .identity import AssertionSemanticKey
+        from .prediction.contracts import (
+            PredictionOperation,
+            compact_retrieval,
+            contract,
+        )
+        from .types import AssertionBasis
+
+        if (
+            type(cue) is not tuple
+            or type(claims) is not tuple
+            or len(cue) > 256
+            or len(claims) > 64
+        ):
+            raise IngressAbort(FailureCode.CAPACITY_ABORT)
+        # The actual frozen L2 cue and reasoning source bounds precede even
+        # pair/member inspection; no larger generic bound may hide traversal.
+        with access(handle, "RUNTIME") as (bounded_runtime, _):
+            if bounded_runtime.prediction_policy is None:
+                raise IngressAbort(FailureCode.UNKNOWN_OPERATION_TYPE)
+            with _pinned_cie_parent(bounded_runtime.parent):
+                with _pinned_effect_context(
+                    bounded_runtime.cie, bounded_runtime.parent
+                ) as cie_state:
+                    cue_bound = dict(cie_state.l2_policy.values)["K_C"]
+                if (
+                    len(cue) > cue_bound
+                    or len(claims) > bounded_runtime.reasoning_policy.max_sources
+                ):
+                    raise IngressAbort(FailureCode.CAPACITY_ABORT)
+        # Bound all nested pair containers before any member validation.
+        if any(type(pair) is not tuple or len(pair) != 2 for pair in cue):
+            raise IngressAbort(FailureCode.INVALID_INPUT)
+        canonical_identity_bytes((cue, claims))
+        if any(
+            type(claim) is not AssertionSemanticKey
+            or claim.basis not in (AssertionBasis.DERIVED, AssertionBasis.HYPOTHETICAL)
+            for claim in claims
+        ):
+            raise IngressAbort(FailureCode.CROSS_CAPABILITY_ADAPTER_TYPE_VIOLATION)
+        if tuple(cid for cid, _ in cue) != tuple(sorted({cid for cid, _ in cue})):
+            raise IngressAbort(FailureCode.INVALID_INPUT)
+        if any(
+            type(cid) is not int
+            or cid < 0
+            or type(drive) not in (int, float)
+            or not 0 < drive <= 1
+            for cid, drive in cue
+        ):
+            raise IngressAbort(FailureCode.INVALID_INPUT)
+        cue = tuple((cid, float(drive)) for cid, drive in cue)
+        with access(handle, "RUNTIME") as (runtime, _):
+            if runtime.prediction_policy is None:
+                raise IngressAbort(FailureCode.UNKNOWN_OPERATION_TYPE)
+            with _pinned_cie_parent(runtime.parent) as (domain, _, _):
+                ingress = domain.ingress
+            with _pinned_prediction_core(ingress, receipt) as reader:  # noqa: SIM117 -- explicit Core -> Life/ledger boundary
+                with (
+                    _pinned_cie_parent(runtime.parent, authority, revision) as (
+                        _,
+                        item,
+                        _,
+                    ),
+                    item.budget.lock,
+                ):
+                    with _pinned_cie_work(
+                        runtime.cie, cie, item, snapshot, reader.binding
+                    ) as epoch:
+                        available = tuple(
+                            e.payload.values[0]
+                            for e in epoch.snapshot.entries
+                            if e.category == "ASSERTION"
+                            and e.payload.kind == "AssertionRecord"
+                        )
+                        if any(claim not in available for claim in claims):
+                            raise IngressAbort(
+                                FailureCode.INVALID_FORMAL_AUTHORITY,
+                                "reasoning/hypothesis input must be admitted in this exact CIE",
+                            )
+                        from .types import DependencyKind
+
+                        if any(
+                            claim.basis is AssertionBasis.HYPOTHETICAL
+                            and not any(
+                                r.kind is DependencyKind.HYPOTHESIS
+                                for r in claim.dependencies
+                            )
+                            for claim in claims
+                        ):
+                            raise IngressAbort(FailureCode.INVALID_DEPENDENCY)
+                        owner = item.work_owner or _Owner(runtime)
+                        if owner.runtime is not runtime:
+                            raise IngressAbort(FailureCode.OWNER_AUTHORITY_STALE)
+                        with owner.lock:
+                            operation = PredictionOperation.PROJECT
+                            wc = contract(operation, "PROJECT").work_class
+                            token, reservation, staged = _prepare_reservation(
+                                item, 1, wc
+                            )
+                            old = item.budget.index
+                            try:
+                                item.budget.index = staged
+                                charge, consumed = _prepare_consumption(
+                                    item, token, reservation.units[0], wc
+                                )
+                            finally:
+                                item.budget.index = old
+                            # Charge before any retrieval/discovery; failures consume it.
+                            item.budget.index = consumed
+                            item.work_owner = owner
+                            runtime.owners[id(authority)] = owner
+                        config = MemoryConfig(
+                            **dict(epoch.binding.environment.l2_policy.values)
+                        )
+                        result = reader.retrieve(config, cue)
+                        if type(result) is RetrievalFailure:
+                            if result.code is not L2Failure.EMPTY_CUE:
+                                raise IngressAbort(FailureCode.CAPACITY_ABORT)
+                            capture = CanonicalDescriptor(
+                                "PredictionRetrievalCapture", ((), (), ())
+                            )
+                        else:
+                            capture = compact_retrieval(
+                                result, runtime.prediction_policy, targets=True
+                            )
+                        origin_class = (
+                            "INTERNAL_ONLY"
+                            if receipt is None
+                            else ("MIXED" if cue or claims else "TRUSTED_ONLY")
+                        )
+                        provenance = CanonicalDescriptor(
+                            "PredictionSessionProvenance",
+                            (
+                                reader.runtime,
+                                reader.occurrence,
+                                reader.revision,
+                                reader.continuity,
+                                cue,
+                                claims,
+                                epoch.binding.environment.l2_policy,
+                            ),
+                        )
+                        data = CanonicalDescriptor(
+                            "PredictionProjectionInput",
+                            (origin_class, snapshot, capture, provenance),
+                        )
+                        binding = CanonicalDescriptor(
+                            "PredictionWorkPermitBinding",
+                            (snapshot, charge.canonical_descriptor(), owner.index[0]),
+                        )
+                        origin = (reader.binding, provenance, capture.values[0])
+                        with owner.lock:
+                            return prediction_record(
+                                runtime,
+                                owner,
+                                authority,
+                                revision,
+                                operation,
+                                data,
+                                binding,
+                                origin,
+                            )
+
+    def prediction_completed(handle, permit, item, snapshot):
+        with (
+            access(handle, "RUNTIME") as (runtime, _),
+            access(permit, "PERMIT") as (own, record),
+        ):
+            if (
+                own is not runtime
+                or not record.prediction
+                or record.authority is not item.authority
+                or record.revision != item.lifecycle[1]
+            ):
+                raise IngressAbort(FailureCode.INVALID_FORMAL_AUTHORITY)
+            with record.owner.lock:
+                if (
+                    record.state != "DONE"
+                    or record.output is None
+                    or record.owner.closing
+                    or record.origin is None
+                ):
+                    raise IngressAbort(FailureCode.INVALID_FORMAL_AUTHORITY)
+                if record.work.values[1].values[1] != snapshot:
+                    raise IngressAbort(FailureCode.CIE_STALE)
+                return _snapshot(record.output.output), tuple(
+                    _snapshot(v) for v in record.origin
+                )
+
+    def prediction_audit(handle, permit, item):
+        with (
+            access(handle, "RUNTIME") as (runtime, _),
+            access(permit, "PERMIT") as (own, record),
+        ):
+            if (
+                own is not runtime
+                or not record.prediction
+                or record.authority is not item.authority
+                or record.audit_identity is None
+                or record.audit_identity.kind != "PredictionWorkPermitBinding"
+            ):
+                raise IngressAbort(FailureCode.INVALID_FORMAL_AUTHORITY)
+            with record.owner.lock:
+                return _snapshot(record.audit_identity)
+
+    def forecast_capture(handle, forecast, reader, config, offset, charge):
+        """Escrow already charged by the shared effect owner; no general fallback.
+
+        Only a privately validated FRR can reach this fixed producer. Receipts
+        and the read facet remain in acquisition infrastructure, never workers.
+        """
+        from .effects import _validate_forecast_record
+        from .ingress import _validate_prediction_reader
+        from .prediction.contracts import PredictionOperation, compact_retrieval
+
+        _validate_forecast_record(forecast, handle)
+        _validate_prediction_reader(reader)
+        if forecast.status is not ForecastStatus.PENDING:
+            raise IngressAbort(FailureCode.OPERATIONAL_EFFECT_AUTHORITY_STALE)
+        from .invocation import _validate_forecast_charge
+
+        _validate_forecast_charge(forecast.pool, offset, "CAPTURE", charge)
+
+        with access(handle, "RUNTIME") as (runtime, _):
+            if (
+                runtime.prediction_policy is None
+                or charge.source_kind is not BudgetSourceKind.FORECAST_ESCROW
+            ):
+                raise IngressAbort(FailureCode.MISSING_BUDGET_CHARGE)
+            owner = forecast.work_owner or _Owner(runtime)
+            if owner.runtime is not runtime or owner.closing:
+                raise IngressAbort(FailureCode.OWNER_AUTHORITY_STALE)
+            if reader.explicitly_empty:
+                data = CanonicalDescriptor("PredictionRetrievalCapture", ((), (), ()))
+            else:
+                data = compact_retrieval(
+                    reader.retrieve(config, ()),
+                    runtime.prediction_policy,
+                    targets=False,
+                )
+            binding = CanonicalDescriptor(
+                "ForecastCapturePermitBinding",
+                (
+                    forecast.commitment.identity,
+                    reader.occurrence,
+                    offset,
+                    charge.canonical_descriptor(),
+                ),
+            )
+            with owner.lock:
+                permit, frame = prediction_record(
+                    runtime,
+                    owner,
+                    forecast.fda,
+                    forecast.revision,
+                    PredictionOperation.CAPTURE,
+                    data,
+                    binding,
+                    None,
+                )
+                forecast.work_owner = owner
+            # Run the same one-shot WEP machinery. Existing lifecycle is already
+            # held; work owner is released before the effect owner is acquired.
+            prediction_execute(
+                handle, runtime, owner.index[1][id(permit)], frame, already_pinned=True
+            )
+            with owner.lock, registry_lock:
+                record = owner.index[1][id(permit)]
+                proven = _snapshot(record.output.output)
+                record.state = "RETIRED"
+                record.work = record.image = record.binding = record.output = None
+                handles.pop(id(permit), None)
+                owner.index = (owner.index[0], {})
+            return proven
+
+    def retire_forecast_work(handle, forecast, *, terminal=True):
+        from .effects import _validate_forecast_record
+
+        _validate_forecast_record(forecast, handle)
+        with access(handle, "RUNTIME") as (runtime, _):
+            owner = forecast.work_owner
+            if owner is None:
+                return
+            if owner.runtime is not runtime:
+                raise IngressAbort(FailureCode.INVALID_FORMAL_AUTHORITY)
+            with owner.lock, registry_lock:
+                for key, record in owner.index[1].items():
+                    record.state = "RETIRED"
+                    record.work = record.image = record.binding = record.output = (
+                        record.origin
+                    ) = None
+                    handles.pop(key, None)
+                owner.index = (owner.index[0], {})
+                owner.closing = terminal
+
+    def validate_prediction_attachment(handle, parent, cie, policy):
+        with access(handle, "RUNTIME") as (runtime, _):
+            if (
+                runtime.parent is not parent
+                or runtime.cie is not cie
+                or runtime.prediction_policy != policy
+            ):
+                raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
+
     return (
         WorkRuntime,
         create_work_runtime,
@@ -757,6 +1239,12 @@ def _build_work_system():
         source_input,
         retire_epoch,
         cleanup_epoch,
+        prediction_project,
+        prediction_completed,
+        forecast_capture,
+        prediction_audit,
+        retire_forecast_work,
+        validate_prediction_attachment,
     )
 
 
@@ -767,5 +1255,11 @@ def _build_work_system():
     _reasoning_source_input,
     _retire_reasoning_epoch,
     _cleanup_reasoning_epoch,
+    _prediction_project,
+    _completed_prediction_result,
+    _forecast_capture,
+    _prediction_audit_binding,
+    _retire_forecast_work,
+    _validate_prediction_attachment,
 ) = _build_work_system()
 del _build_work_system

@@ -272,6 +272,7 @@ class ReasoningRuntime:
         *,
         sources=None,
         internal_results=(),
+        prediction_views=(),
         discovery=None,
         publication_charge=False,
     ):
@@ -304,6 +305,7 @@ class ReasoningRuntime:
             prepared,
             source_capabilities=sources,
             internal_results=internal_results,
+            prediction_views=prediction_views,
             discovery_permit=discovery,
         )
         output = self.work.execute(permit, work)
@@ -366,6 +368,7 @@ class ReasoningRuntime:
         branch=0,
         query_mode="EXISTS_INCOMPATIBILITY",
         internal_results=(),
+        prediction_views=(),
     ):
         if type(branch) is not int or branch < 0:
             raise ValueError("canonical branch index required")
@@ -386,6 +389,7 @@ class ReasoningRuntime:
                 snapshot,
                 capabilities,
                 internal_results,
+                prediction_views,
             )
             permit, output, charge = self._work(
                 authority,
@@ -397,6 +401,7 @@ class ReasoningRuntime:
                 data,
                 sources=capabilities,
                 internal_results=internal_results,
+                prediction_views=prediction_views,
                 publication_charge=True,
             )
             snapshot, _ = self._publish(

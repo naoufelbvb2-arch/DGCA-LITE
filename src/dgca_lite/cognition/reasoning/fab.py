@@ -41,6 +41,7 @@ def validate(content, *, allowed_referents=None):
         "SingleValued": (CanonicalDescriptor,),
         "Assign": (CanonicalDescriptor,) * 3,
         "InternalRetrievalStatement": (bytes,),
+        "PredictionOutcomeStatement": (bytes,),
         "ObservedCoreFrontier": (tuple, tuple),
     }
 
@@ -82,6 +83,11 @@ def validate(content, *, allowed_referents=None):
                 raise ValueError("bounded nonempty proposition name required")
             if node.kind == "InternalRetrievalStatement" and len(node.values[0]) > 8192:
                 raise ValueError("bounded retrieval literal required")
+            if (
+                node.kind == "PredictionOutcomeStatement"
+                and not 0 < len(node.values[0]) <= 65536
+            ):
+                raise ValueError("bounded typed prediction literal required")
             if node.kind == "ObservedCoreFrontier":
                 frontier, activation = node.values
                 if len(frontier) > 256 or len(activation) > 256:

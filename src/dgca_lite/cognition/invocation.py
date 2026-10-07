@@ -33,7 +33,7 @@ from .ingress import (
 )
 from .locks import RankedBarrier, _deferred_cleanup
 from .serialization import canonical_identity_bytes
-from .types import FailureCode, InvocationState
+from .types import BudgetSourceKind, FailureCode, InvocationState
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +145,13 @@ def _build_invocation_system():
         lock: object = field(default_factory=lambda: RankedBarrier(2))
         # One publication swaps units, reservation records and the next sequence.
         index: tuple = field(default_factory=lambda: ((), {}, 0))
+
+    @dataclass(slots=True)
+    class _ForecastPool:
+        identity: CanonicalDescriptor
+        budget: _Budget
+        tokens: tuple
+        forecast: bool = True
 
     @dataclass(slots=True)
     class _Invocation:
@@ -355,7 +362,14 @@ def _build_invocation_system():
                 ),
             )
         )
-        output = BudgetChargeView(*image.values)
+        output = BudgetChargeView(
+            *image.values,
+            source_kind=(
+                BudgetSourceKind.FORECAST_ESCROW
+                if getattr(item, "forecast", False)
+                else BudgetSourceKind.INVOCATION_GENERAL
+            ),
+        )
         staged = list(units)
         staged[index] = _Unit("CONSUMED", units[index].reservation)
         return output, (tuple(staged), records, sequence)
@@ -389,7 +403,14 @@ def _build_invocation_system():
                 ),
             )
         )
-        return BudgetChargeView(*data.values)
+        return BudgetChargeView(
+            *data.values,
+            source_kind=(
+                BudgetSourceKind.FORECAST_ESCROW
+                if getattr(item, "forecast", False)
+                else BudgetSourceKind.INVOCATION_GENERAL
+            ),
+        )
 
     def retire_unused(item: _Invocation) -> None:
         units, records, sequence = item.budget.index
@@ -489,7 +510,12 @@ def _build_invocation_system():
                         )
                     )
                     return BudgetLedgerView(
-                        _snapshot(item.identity), len(units), *counts
+                        _snapshot(item.identity),
+                        len(units),
+                        *counts,
+                        delegated=sum(
+                            u.state == "DELEGATED_FORECAST_POOL" for u in units
+                        ),
                     )
 
         def unit_state(self, authority: object, index: int) -> str:
@@ -821,6 +847,105 @@ def _build_invocation_system():
             with item.budget.lock:
                 yield domain, item, binding
 
+    def prepare_forecast_delegation(item, horizon, binding):
+        """Prospective one-way issuance. Caller holds Core/Life/parent ledger.
+
+        All units/reservations use the existing accounting structures. Nothing
+        is published here; the Unit-6 seal publishes parent and pool together.
+        """
+        if type(horizon) is not int or not 1 <= horizon <= 64:
+            raise IngressAbort(FailureCode.INVALID_INPUT)
+        work = CanonicalDescriptor("ForecastEscrowReservation", (binding, horizon))
+        _, reservation, staged_parent = prepare_reservation(item, 2 * horizon, work)
+        identity = CanonicalDescriptor(
+            "ForecastEscrowIdentity", (reservation.identity,)
+        )
+        units, records, sequence = staged_parent
+        delegated = list(units)
+        for index in reservation.units:
+            delegated[index] = _Unit("DELEGATED_FORECAST_POOL", reservation.identity)
+        staged_parent = (tuple(delegated), records, sequence)
+        pool_units, pool_records, tokens = [], {}, []
+        for ordinal in range(2 * horizon):
+            phase = "CAPTURE" if ordinal % 2 == 0 else "EVALUATION"
+            work_class = CanonicalDescriptor(
+                "PredictionWorkClass", (phase, ordinal // 2 + 1)
+            )
+            rid = CanonicalDescriptor(
+                "ForecastReservationIdentity", (identity, ordinal, work_class)
+            )
+            token = object.__new__(BudgetReservation)
+            record = _Reservation(
+                token,
+                rid,
+                (ordinal,),
+                work_class,
+                canonical_identity_bytes(
+                    CanonicalDescriptor(
+                        "ReservationFields", (rid, (ordinal,), work_class)
+                    )
+                ),
+            )
+            pool_units.append(_Unit("RESERVED", rid))
+            pool_records[id(token)] = record
+            tokens.append(token)
+        budget = _Budget(index=(tuple(pool_units), pool_records, 0))
+        return _ForecastPool(identity, budget, tuple(tokens)), staged_parent
+
+    def prepare_forecast_consumption(pool, offset, phase):
+        if type(pool) is not _ForecastPool or type(offset) is not int:
+            raise IngressAbort(FailureCode.MISSING_BUDGET_CHARGE)
+        if type(phase) is not str or phase not in ("CAPTURE", "EVALUATION"):
+            raise IngressAbort(FailureCode.BUDGET_WORKCLASS_MISMATCH)
+        ordinal = 2 * (offset - 1) + (phase == "EVALUATION")
+        if not 0 <= ordinal < len(pool.tokens):
+            raise IngressAbort(FailureCode.BUDGET_ABORT)
+        return prepare_consumption(
+            pool,
+            pool.tokens[ordinal],
+            ordinal,
+            CanonicalDescriptor("PredictionWorkClass", (phase, offset)),
+        )
+
+    def forecast_retirement(pool, index=None):
+        if type(pool) is not _ForecastPool:
+            raise IngressAbort(FailureCode.MISSING_BUDGET_CHARGE)
+        units, records, sequence = pool.budget.index if index is None else index
+        return (
+            tuple(
+                _Unit("RETIRED", u.reservation) if u.state == "RESERVED" else u
+                for u in units
+            ),
+            records,
+            sequence,
+        )
+
+    def validate_forecast_charge(pool, offset, phase, charge):
+        if (
+            type(pool) is not _ForecastPool
+            or type(offset) is not int
+            or type(charge) is not BudgetChargeView
+        ):
+            raise IngressAbort(FailureCode.MISSING_BUDGET_CHARGE)
+        if phase not in ("CAPTURE", "EVALUATION"):
+            raise IngressAbort(FailureCode.BUDGET_WORKCLASS_MISMATCH)
+        ordinal = 2 * (offset - 1) + (phase == "EVALUATION")
+        if (
+            not 0 <= ordinal < len(pool.tokens)
+            or pool.budget.index[0][ordinal].state != "CONSUMED"
+        ):
+            raise IngressAbort(FailureCode.MISSING_BUDGET_CHARGE)
+        actual = inspect_charge(
+            pool,
+            pool.tokens[ordinal],
+            ordinal,
+            CanonicalDescriptor("PredictionWorkClass", (phase, offset)),
+        )
+        if canonical_identity_bytes(
+            actual.canonical_descriptor()
+        ) != canonical_identity_bytes(charge.canonical_descriptor()):
+            raise IngressAbort(FailureCode.MISSING_BUDGET_CHARGE)
+
     return (
         InvocationRuntime,
         InvocationBudgetLedger,
@@ -831,6 +956,10 @@ def _build_invocation_system():
         prepare_consumption,
         pinned_effect_budget,
         inspect_charge,
+        prepare_forecast_delegation,
+        prepare_forecast_consumption,
+        forecast_retirement,
+        validate_forecast_charge,
     )
 
 
@@ -844,5 +973,9 @@ def _build_invocation_system():
     _prepare_consumption,
     _pinned_effect_budget,
     _inspect_charge,
+    _prepare_forecast_delegation,
+    _prepare_forecast_consumption,
+    _forecast_retirement,
+    _validate_forecast_charge,
 ) = _build_invocation_system()
 del _build_invocation_system

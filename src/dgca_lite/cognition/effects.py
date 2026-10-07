@@ -1,10 +1,8 @@
-"""Unit-6 logical effect infrastructure, NOT physical/semantic effect execution.
+"""Shared logical effect gate with fixed Reasoning/Prediction production handlers.
 
-Production catalogue is EMPTY. A separate private, fixed mechanical harness
-exercises the same transaction with passive audit records only. There is no
-executor, plugin, transport callback, deferred child permit or child-mint API.
-Future concrete contracts must stage any exact child inside this transaction;
-a historical commit cannot be converted into new authority after parent close.
+Unconfigured Unit-6 runtimes still have an empty production catalogue. No
+executor/plugin/caller callback exists. Forecast delegation stages its exact
+child inside the seal transaction; historical audit is never child issuance.
 """
 
 from contextlib import contextmanager, nullcontext
@@ -29,14 +27,22 @@ from .effect import (
     freeze_effect,
 )
 from .effect_types import _MechanicalEffectOperation
-from .identity import CanonicalDescriptor, CognitiveEnvironmentBinding, SnapshotBinding
-from .ingress import _snapshot
+from .identity import (
+    CanonicalDescriptor,
+    CognitiveEnvironmentBinding,
+    ScopeIdentity,
+    SnapshotBinding,
+)
+from .ingress import _pinned_prediction_core, _snapshot
 from .invocation import (
     InvocationRuntime,
+    _forecast_retirement,
     _inspect_charge,
     _pinned_cie_parent,
     _pinned_effect_budget,
     _prepare_consumption,
+    _prepare_forecast_consumption,
+    _prepare_forecast_delegation,
     _prepare_reservation,
 )
 from .locks import RankedBarrier, _deferred_cleanup
@@ -52,8 +58,21 @@ from .reasoning.fab import d
 from .reasoning.schemas import ReasoningOperation, ReasoningPolicy
 from .reasoning.schemas import catalogue as reasoning_catalogue
 from .serialization import canonical_identity_bytes
-from .types import BudgetSourceKind, FailureCode, InvocationState, WorkEffectClass
-from .work import _completed_reasoning_result, _retire_reasoning_epoch
+from .types import (
+    BudgetSourceKind,
+    CaptureState,
+    FailureCode,
+    ForecastStatus,
+    InvocationState,
+    WorkEffectClass,
+)
+from .work import (
+    _completed_prediction_result,
+    _completed_reasoning_result,
+    _forecast_capture,
+    _prediction_audit_binding,
+    _retire_reasoning_epoch,
+)
 
 _OPERATIONS = tuple((member, member.value) for member in _MechanicalEffectOperation)
 
@@ -117,6 +136,10 @@ def _before_effect_publish():
     """
 
 
+def _before_forecast_capture():
+    """Fixed test fault boundary; never a configurable callback."""
+
+
 def _reasoning_contract(policy, target, payload, scope):
     if type(policy) is not ReasoningPolicy:
         raise IngressAbort(FailureCode.UNKNOWN_OPERATION_TYPE)
@@ -146,6 +169,9 @@ def _reasoning_contract(policy, target, payload, scope):
 def _build_effect_system():
     registry_lock = RankedBarrier(5)
     handles = {}
+    # These entries belong to the existing effect registry and share its lock.
+    # Descriptors, Python class membership and copied fields are not admission.
+    forecast_handles = {}
 
     @dataclass(slots=True)
     class _Runtime:
@@ -157,6 +183,8 @@ def _build_effect_system():
         owners: dict = field(default_factory=dict)
         retired: bool = False
         reasoning_policy: object = None
+        prediction_policy: object = None
+        forecasts: dict = field(default_factory=dict)
 
     @dataclass(slots=True)
     class _Owner:
@@ -164,11 +192,147 @@ def _build_effect_system():
         lock: object = field(default_factory=lambda: RankedBarrier(4))
         index: dict = field(default_factory=dict)
         closed: bool = False
+        seal_index: dict = field(default_factory=dict)
 
         def parent_close(self):
             with self.lock:
                 # Preserve committed historical effects, NEVER new authority.
                 self.closed = True
+
+    @dataclass(slots=True)
+    class _Forecast:
+        fda: object
+        commitment: object
+        pool: object
+        owner: object
+        work: object
+        origin_root: int
+        seal_key: bytes
+        seal_effect_key: bytes
+        revision: int = 0
+        coverage: tuple = ()
+        status: object = ForecastStatus.PENDING
+        work_owner: object = None
+        pending: object = None
+        evaluation_owner: object = None
+
+    def forecast_for(runtime, token):
+        from .prediction.fda import ForecastDelegatedAuthority
+
+        with registry_lock:
+            entry = forecast_handles.get(id(token))
+            if (
+                type(token) is not ForecastDelegatedAuthority
+                or entry is None
+                or entry[0]() is not token
+                or entry[1] is not runtime
+            ):
+                raise IngressAbort(FailureCode.OPERATIONAL_EFFECT_AUTHORITY_STALE)
+            record = entry[2]
+            if (
+                type(record) is not _Forecast
+                or record.fda is not token
+                or record.status is not ForecastStatus.PENDING
+                or runtime.forecasts.get(
+                    canonical_identity_bytes(record.commitment.identity)
+                )
+                is not record
+            ):
+                raise IngressAbort(FailureCode.OPERATIONAL_EFFECT_AUTHORITY_STALE)
+            return record
+
+    def outcome(record):
+        from .prediction.commitment import ForecastCommitmentView
+        from .prediction.observation import ForecastOutcomeView
+
+        commitment = ForecastCommitmentView(
+            *_snapshot(record.commitment.canonical_descriptor()).values
+        )
+        return ForecastOutcomeView(
+            commitment, record.status, _snapshot(record.coverage)
+        )
+
+    def retire(runtime, record, status):
+        """Bounded negative lifecycle transition. No new cognitive evaluation."""
+        from .work import _retire_forecast_work
+
+        with record.pool.budget.lock:
+            # Terminal authority is already revoked even if a prior negative
+            # cleanup failed. Cleanup cannot replace its published result.
+            if record.status is not ForecastStatus.PENDING:
+                status = record.status
+            returned = outcome_with_status(record, status)
+            staged_budget = _forecast_retirement(record.pool)
+            _retire_forecast_work(record.work, record)
+            with record.owner.lock, registry_lock:
+                record.pool.budget.index = staged_budget
+                runtime.forecasts.pop(
+                    canonical_identity_bytes(record.commitment.identity), None
+                )
+                forecast_handles.pop(id(record.fda), None)
+                # Retain only already-committed identity/charge accounting, not
+                # a private prediction/result payload usable as cognitive memory.
+                record.owner.index.pop(record.seal_effect_key, None)
+                record.owner.seal_index[record.seal_key] = None
+                record.status = status
+                record.revision += 1
+                if record.evaluation_owner is not None:
+                    record.evaluation_owner.index = {}
+                    record.evaluation_owner.closed = True
+                record.commitment = record.coverage = record.work_owner = (
+                    record.pending
+                ) = None
+                record.fda = record.work = record.pool = None
+            return returned
+
+    def outcome_with_status(record, status):
+        from .prediction.observation import ForecastOutcomeView
+
+        old = outcome(record)
+        return ForecastOutcomeView(old.commitment, status, old.coverage)
+
+    def seal_request(runtime, binding, target, horizon):
+        from .prediction.targets import target_from_data
+
+        if (
+            type(horizon) is not int
+            or not 1 <= horizon <= runtime.prediction_policy.max_horizon
+        ):
+            raise IngressAbort(FailureCode.INVALID_INPUT)
+        try:
+            target_from_data(target)
+            target = _snapshot(target)
+            key = canonical_identity_bytes(
+                d(
+                    "ForecastSealRequest",
+                    binding,
+                    target,
+                    horizon,
+                    runtime.prediction_policy.canonical_descriptor(),
+                )
+            )
+        except (ValueError, TypeError, AttributeError) as error:
+            raise IngressAbort(FailureCode.INVALID_INPUT) from error
+        return target, key
+
+    def seal_duplicate(runtime, item, key):
+        owner = owner_for(runtime, item)
+        if owner is None:
+            return None
+        with owner.lock:
+            if key not in owner.seal_index:
+                return None
+            identity = owner.seal_index[key]
+            if identity is None:
+                raise IngressAbort(FailureCode.OPERATIONAL_EFFECT_AUTHORITY_STALE)
+            record = runtime.forecasts.get(identity)
+            if record is None or record.status is not ForecastStatus.PENDING:
+                raise IngressAbort(FailureCode.OPERATIONAL_EFFECT_AUTHORITY_STALE)
+            view = outcome(record).commitment
+            # A historical lookup is never child-authority recovery.
+            return view, record.fda if item.lifecycle[
+                0
+            ] is InvocationState.ACTIVE else None
 
     @contextmanager
     def access(handle):
@@ -359,6 +523,293 @@ def _build_effect_system():
 
     class EffectRuntime(_OpaqueHandle):
         __slots__ = ()
+
+        def seal_forecast(
+            self,
+            authority,
+            revision,
+            ledger,
+            cie,
+            work_runtime,
+            projection_permit,
+            target,
+            horizon,
+        ):
+            nonlocal forecast_handles
+            from .prediction.commitment import ForecastCommitmentView
+            from .prediction.contracts import PredictionOperation, contract
+            from .prediction.fda import ForecastDelegatedAuthority
+            from .prediction.targets import TargetGuard
+
+            with access(self) as runtime:
+                if runtime.prediction_policy is None:
+                    raise IngressAbort(FailureCode.UNKNOWN_OPERATION_TYPE)
+                with _pinned_effect_budget(runtime.parent, authority, ledger) as (
+                    domain,
+                    item,
+                    _,
+                ):
+                    audit = _prediction_audit_binding(
+                        work_runtime, projection_permit, item
+                    )
+                    target, key = seal_request(runtime, audit, target, horizon)
+                    previous = seal_duplicate(runtime, item, key)
+                    if previous is not None:
+                        return previous
+                    current(item, revision)
+                    ingress = domain.ingress
+                with _pinned_prediction_core(ingress) as reader:  # noqa: SIM117 -- explicit Core -> Life/ledger boundary
+                    with _pinned_effect_budget(runtime.parent, authority, ledger) as (
+                        _,
+                        item,
+                        _,
+                    ):
+                        previous = seal_duplicate(runtime, item, key)
+                        if previous is not None:
+                            return previous
+                        current(item, revision)
+                        snapshot = audit.values[0]
+                        with _pinned_cie_work(
+                            runtime.cie, cie, item, snapshot, reader.binding
+                        ):
+                            proven, origin = _completed_prediction_result(
+                                work_runtime, projection_permit, item, snapshot
+                            )
+                            origin_core, provenance, witnesses = origin
+                            if (
+                                proven.values[0] != "TRUSTED_ONLY"
+                                or not witnesses
+                                or target not in proven.values[2]
+                                or origin_core != reader.binding
+                                or provenance.values[2] != reader.revision
+                                or provenance.values[3] != reader.continuity
+                                or provenance.values[4]
+                                or provenance.values[5]
+                            ):
+                                raise IngressAbort(FailureCode.INVALID_FORMAL_AUTHORITY)
+                            if not reader.target_valid(target):
+                                raise IngressAbort(FailureCode.ENVIRONMENT_STALE)
+                            if (
+                                len(runtime.forecasts)
+                                >= runtime.prediction_policy.max_live_forecasts
+                            ):
+                                raise IngressAbort(FailureCode.CAPACITY_ABORT)
+                            owner = owner_for(runtime, item) or _Owner(runtime)
+                            with owner.lock, registry_lock:
+                                if owner.closed:
+                                    raise IngressAbort(
+                                        FailureCode.OPERATIONAL_EFFECT_AUTHORITY_STALE
+                                    )
+                                if len(owner.seal_index) + len(owner.index) >= min(
+                                    runtime.policy.max_commits_per_owner,
+                                    len(item.budget.index[0]),
+                                ):
+                                    raise IngressAbort(FailureCode.CAPACITY_ABORT)
+                                operation = contract(PredictionOperation.SEAL, "SEAL")
+                                reservation, plan, reserved = _prepare_reservation(
+                                    item, 1, operation.work_class
+                                )
+                                old_budget = item.budget.index
+                                try:
+                                    item.budget.index = reserved
+                                    charge, charged = _prepare_consumption(
+                                        item,
+                                        reservation,
+                                        plan.units[0],
+                                        operation.work_class,
+                                    )
+                                    item.budget.index = charged
+                                    pool, delegated = _prepare_forecast_delegation(
+                                        item,
+                                        horizon,
+                                        d(
+                                            "ForecastEscrowOwner",
+                                            item.identity,
+                                            audit.values[2],
+                                            target,
+                                            horizon,
+                                        ),
+                                    )
+                                finally:
+                                    item.budget.index = old_budget
+                                policy = (
+                                    runtime.prediction_policy.canonical_descriptor()
+                                )
+                                guard = TargetGuard(
+                                    target, policy
+                                ).canonical_descriptor()
+                                observation = d(
+                                    "ForecastObservationPolicy",
+                                    "ROOT_SEEDED_SOURCE_VIEW_ONLY_V1",
+                                    snapshot.cie.environment.l2_policy,
+                                )
+                                boundary = d(
+                                    "ForecastBoundaryPolicy",
+                                    "TERMINATE_ON_HARD_BOUNDARY_V1",
+                                )
+                                scope = ScopeIdentity(
+                                    "PREDICTION",
+                                    reader.runtime,
+                                    d(
+                                        "ForecastScope",
+                                        item.identity,
+                                        audit.values[2],
+                                        target,
+                                        horizon,
+                                    ),
+                                )
+                                future = d(
+                                    "FutureEvaluationBinding",
+                                    reader.runtime,
+                                    reader.binding.core_policy,
+                                    reader.revision,
+                                    reader.continuity,
+                                    policy,
+                                    guard,
+                                    observation,
+                                    boundary,
+                                )
+                                commitment = ForecastCommitmentView(
+                                    origin_core,
+                                    provenance,
+                                    target,
+                                    guard,
+                                    horizon,
+                                    scope,
+                                    policy,
+                                    observation,
+                                    boundary,
+                                    future,
+                                    pool.identity,
+                                )
+                                effect = freeze_effect(
+                                    runtime.policy,
+                                    CanonicalEffectDescriptor(
+                                        d("EffectType", PredictionOperation.SEAL.value),
+                                        d("ForecastTarget", target),
+                                        commitment.canonical_descriptor(),
+                                        d("ForecastScopeBinding", scope),
+                                        snapshot.cie.environment,
+                                        d(
+                                            "EffectOwnerBinding",
+                                            item.identity,
+                                            revision,
+                                        ),
+                                        operation.canonical_descriptor(),
+                                    ),
+                                    payload_limits=ValueLimits(),
+                                )
+                                identity = EffectCommitID(
+                                    effect,
+                                    d(
+                                        "EffectAuthorityContext",
+                                        effect.owner_binding,
+                                        effect.environment_revision,
+                                        snapshot,
+                                    ),
+                                )
+                                view = EffectCommitView(identity, effect, charge)
+                                # Prebuild independent returned data before publication.
+                                returned = ForecastCommitmentView(
+                                    *_snapshot(commitment.canonical_descriptor()).values
+                                )
+                                fda = object.__new__(ForecastDelegatedAuthority)
+                                record = _Forecast(
+                                    fda,
+                                    commitment,
+                                    pool,
+                                    owner,
+                                    work_runtime,
+                                    reader.binding.next_root_id - 1,
+                                    key,
+                                    identity.canonical_bytes,
+                                )
+                                # Prospectively prove even the final gap ledger
+                                # and its exact effect can fit. No later capture
+                                # failure may strand a completed logical horizon.
+                                try:
+                                    preflight_forecast(runtime, record, reader)
+                                except (ValueError, TypeError) as error:
+                                    raise IngressAbort(
+                                        FailureCode.CAPACITY_ABORT
+                                    ) from error
+                                forecast_key = canonical_identity_bytes(
+                                    commitment.identity
+                                )
+                                index = dict(owner.index)
+                                index[identity.canonical_bytes] = view
+                                seals = dict(owner.seal_index)
+                                seals[key] = forecast_key
+                                forecasts = dict(runtime.forecasts)
+                                forecasts[forecast_key] = record
+                                owners = dict(runtime.owners)
+                                owners[id(authority)] = owner
+                                registrations = dict(forecast_handles)
+                                registrations[id(fda)] = (ref(fda), runtime, record)
+                                old = (
+                                    item.budget.index,
+                                    item.effect_owner,
+                                    runtime.owners,
+                                    owner.index,
+                                    owner.seal_index,
+                                    runtime.forecasts,
+                                    dict(forecast_handles),
+                                )
+                                _before_effect_publish()
+                                try:
+                                    item.budget.index = delegated
+                                    item.effect_owner = owner
+                                    runtime.owners = owners
+                                    owner.index = index
+                                    owner.seal_index = seals
+                                    runtime.forecasts = forecasts
+                                    forecast_handles = registrations
+                                except BaseException:
+                                    (
+                                        item.budget.index,
+                                        item.effect_owner,
+                                        runtime.owners,
+                                        owner.index,
+                                        owner.seal_index,
+                                        runtime.forecasts,
+                                        old_handles,
+                                    ) = old
+                                    forecast_handles = old_handles
+                                    raise
+                                return returned, fda
+
+        def forecast_outcome(self, fda):
+            with access(self) as runtime, _pinned_cie_parent(runtime.parent):
+                return outcome(forecast_for(runtime, fda))
+
+        def cancel_forecast(self, fda):
+            with access(self) as runtime, _pinned_cie_parent(runtime.parent):
+                record = forecast_for(runtime, fda)
+                return retire(runtime, record, ForecastStatus.CANCELLED)
+
+        def forecast_registry_status(self):
+            with access(self) as runtime, _pinned_cie_parent(runtime.parent):
+                if runtime.prediction_policy is None:
+                    raise IngressAbort(FailureCode.UNKNOWN_OPERATION_TYPE)
+                return len(
+                    runtime.forecasts
+                ), runtime.prediction_policy.max_live_forecasts
+
+        def retry_forecast_publication(self, fda):
+            """Attach an already-produced exact result, never retry computation."""
+            with access(self) as runtime:
+                with _pinned_cie_parent(runtime.parent) as (domain, _, _):
+                    ingress = domain.ingress
+                with _pinned_prediction_core(ingress) as reader:  # noqa: SIM117 -- explicit Core -> Life boundary
+                    with _pinned_cie_parent(runtime.parent):
+                        record = forecast_for(runtime, fda)
+                        stale = forecast_staleness(runtime, record, reader)
+                        if stale is not None:
+                            return retire(runtime, record, stale)
+                        if record.pending is None:
+                            return outcome(record)
+                        with record.pool.budget.lock:
+                            return publish_forecast(runtime, record)
 
         def prepare_effect(
             self, authority, revision, target, payload, scope, *, operation=None
@@ -688,7 +1139,9 @@ def _build_effect_system():
                 with owner.lock, registry_lock:
                     return len(owner.index), runtime.policy.max_commits_per_owner
 
-    def bootstrap(parent, cie, policy, mechanical, reasoning_policy=None):
+    def bootstrap(
+        parent, cie, policy, mechanical, reasoning_policy=None, prediction_policy=None
+    ):
         if policy is None:
             policy = EffectPolicy()
         if (
@@ -703,6 +1156,14 @@ def _build_effect_system():
                 raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
             reasoning_policy = ReasoningPolicy(
                 *reasoning_policy.canonical_descriptor().values
+            )
+        if prediction_policy is not None:
+            from .prediction.projection import PredictionPolicy
+
+            if mechanical or type(prediction_policy) is not PredictionPolicy:
+                raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
+            prediction_policy = PredictionPolicy(
+                *prediction_policy.canonical_descriptor().values[:6]
             )
         catalogue = CanonicalDescriptor(
             "Unit6EffectCatalogue",
@@ -734,6 +1195,10 @@ def _build_effect_system():
                 != reasoning_catalogue(cie_state.reasoning_policy)
             ):
                 raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
+            if prediction_policy is not None and (
+                cie_state.prediction_policy != prediction_policy
+            ):
+                raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
             l3 = _snapshot(
                 CanonicalDescriptor(
                     "L3Unit6PolicyBinding", (cie_state.l3_policy, catalogue)
@@ -747,9 +1212,22 @@ def _build_effect_system():
                         d("ReasoningEffectCatalogue", ReasoningOperation.PUBLISH.value),
                     )
                 )
+            if prediction_policy is not None:
+                l3 = _snapshot(
+                    d(
+                        "L3Unit8Effects",
+                        *l3.values,
+                        prediction_policy.canonical_descriptor(),
+                    )
+                )
             handle = object.__new__(EffectRuntime)
             runtime = _Runtime(
-                parent, cie, frozen, mechanical, reasoning_policy=reasoning_policy
+                parent,
+                cie,
+                frozen,
+                mechanical,
+                reasoning_policy=reasoning_policy,
+                prediction_policy=prediction_policy,
             )
             key = id(handle)
 
@@ -775,18 +1253,370 @@ def _build_effect_system():
                 domain.effect_attached = True
             return handle
 
-    def create_effect_runtime(parent, cie, *, policy=None, reasoning_policy=None):
+    def forecast_staleness(runtime, record, reader):
+        binding = record.commitment.future_evaluation_binding.values
+        if (
+            reader.runtime != binding[0]
+            or reader.binding.core_policy != binding[1]
+            or reader.revision != binding[2]
+            or reader.continuity != binding[3]
+            or runtime.prediction_policy.canonical_descriptor() != binding[4]
+        ):
+            return ForecastStatus.ENVIRONMENT_STALE
+        if not reader.target_valid(record.commitment.target):
+            return ForecastStatus.TARGET_STALE
+        return None
+
+    def publish_forecast(runtime, record):
+        """Exact prepared result publication under Life/pool-ledger barriers.
+
+        A failed publication retains ONE already-paid result for descriptor
+        attachment; it never reruns capture/matching or allocates another unit.
+        """
+        from .prediction.observation import ForecastOutcomeView
+
+        coverage, status, stored, returned = record.pending
+        owner = record.evaluation_owner
+        with owner.lock, registry_lock:
+            candidate = dict(owner.index)
+            candidate[stored.commit_id.canonical_bytes] = stored
+            old = (
+                record.coverage,
+                record.status,
+                record.revision,
+                record.pending,
+                owner.index,
+            )
+            _before_effect_publish()
+            try:
+                record.coverage = coverage
+                record.status = status
+                record.revision += 1
+                record.pending = None
+                owner.index = candidate
+            except BaseException:
+                (
+                    record.coverage,
+                    record.status,
+                    record.revision,
+                    record.pending,
+                    owner.index,
+                ) = old
+                raise
+        if status is not ForecastStatus.PENDING:
+            # The semantic result is already complete. Negative cleanup cannot
+            # mint another status/evaluation, refund budget, or retain payloads.
+            return retire(runtime, record, status)
+        return ForecastOutcomeView(
+            returned.commitment, returned.status, returned.coverage
+        )
+
+    def forecast_evaluation_effect(
+        runtime, record, binding, future, offset, state, capture, previous, charge
+    ):
+        from .prediction.contracts import PredictionOperation, contract
+        from .prediction.observation import ForecastEvaluationID
+
+        operation = contract(PredictionOperation.EVALUATE, "EVALUATION", offset)
+        evaluation = ForecastEvaluationID(
+            record.commitment.identity, future
+        ).canonical_descriptor()
+        payload = d(
+            "ForecastEvaluationInput", evaluation, offset, state, capture, previous
+        )
+        effect = freeze_effect(
+            runtime.policy,
+            CanonicalEffectDescriptor(
+                d("EffectType", PredictionOperation.EVALUATE.value),
+                d("ForecastTarget", record.commitment.target),
+                payload,
+                d("ForecastScopeBinding", record.commitment.scope),
+                environment(runtime, binding),
+                d("ForecastEffectOwnerBinding", record.pool.identity, record.revision),
+                operation.canonical_descriptor(),
+            ),
+            payload_limits=ValueLimits(),
+        )
+        identity = EffectCommitID(
+            effect,
+            d("ForecastEffectAuthorityContext", record.pool.identity, record.revision),
+        )
+        return EffectCommitView(identity, effect, charge)
+
+    def preflight_forecast(runtime, record, reader):
+        from .identity import CoreStateBinding
+        from .prediction.observation import (
+            ForecastOutcomeView,
+            FutureTrustedOccurrenceID,
+        )
+
+        horizon = record.commitment.horizon
+        if horizon > runtime.policy.max_commits_per_owner:
+            raise IngressAbort(
+                FailureCode.CAPACITY_ABORT,
+                "complete forecast evaluation history exceeds effect owner envelope",
+            )
+        origin = reader.binding
+        last = CoreStateBinding(
+            origin.core_identity,
+            origin.version + horizon,
+            origin.tick + horizon,
+            origin.next_root_id + horizon,
+            origin.core_policy,
+        )
+        coverage = tuple(
+            d(
+                "ForecastCoverage",
+                offset,
+                FutureTrustedOccurrenceID(
+                    reader.runtime,
+                    d(
+                        "TrustedCoreOccurrence",
+                        origin.version + offset,
+                        origin.tick + offset,
+                        origin.next_root_id + offset - 1,
+                    ),
+                ).canonical_descriptor(),
+                CaptureState.OBSERVATION_GAP,
+                False,
+            )
+            for offset in range(1, horizon + 1)
+        )
+        future = FutureTrustedOccurrenceID(*coverage[-1].values[1].values)
+        charge, _ = _prepare_forecast_consumption(record.pool, horizon, "EVALUATION")
+        forecast_evaluation_effect(
+            runtime,
+            record,
+            last,
+            future,
+            horizon,
+            CaptureState.OBSERVATION_GAP,
+            d("PredictionRetrievalCapture", (), (), ()),
+            coverage[:-1],
+            charge,
+        )
+        ForecastOutcomeView(
+            record.commitment, ForecastStatus.INCONCLUSIVE_OBSERVATION_GAP, coverage
+        )
+
+    def evaluate_forecast(runtime, record, reader):
+        from dgca_lite.memory.config import MemoryConfig
+
+        from .prediction.evaluation import match, status_after
+        from .prediction.observation import (
+            ForecastOutcomeView,
+            FutureTrustedOccurrenceID,
+        )
+
+        if record.pending is not None:
+            completed = publish_forecast(runtime, record)
+            if completed.status is not ForecastStatus.PENDING:
+                return completed
+        future = FutureTrustedOccurrenceID(reader.runtime, reader.occurrence)
+        occurrence = future.canonical_descriptor()
+        if any(entry.values[1] == occurrence for entry in record.coverage):
+            return outcome(record)
+        if reader.occurrence.values[2] <= record.origin_root:
+            raise IngressAbort(FailureCode.INVALID_FORMAL_AUTHORITY)
+        offset = len(record.coverage) + 1
+        capture_charge, captured_budget = _prepare_forecast_consumption(
+            record.pool, offset, "CAPTURE"
+        )
+        record.pool.budget.index = captured_budget
+        capture = d("PredictionRetrievalCapture", (), (), ())
+        state = CaptureState.OBSERVATION_GAP
+        try:
+            _before_forecast_capture()
+            config = MemoryConfig(
+                **dict(record.commitment.observation_policy.values[1].values)
+            )
+            capture = _forecast_capture(
+                record.work, record, reader, config, offset, capture_charge
+            )
+            state = (
+                CaptureState.PROVEN_EMPTY
+                if reader.explicitly_empty
+                else CaptureState.CAPTURED
+            )
+        except (ValueError, TypeError, RuntimeError, MemoryError, OSError):
+            # The trusted occurrence is genuine independently of this failure.
+            # No fallback emptiness, retry capture, or gap rewriting is allowed.
+            from .work import _retire_forecast_work
+
+            _retire_forecast_work(record.work, record, terminal=False)
+        evaluation_charge, evaluated_budget = _prepare_forecast_consumption(
+            record.pool, offset, "EVALUATION"
+        )
+        try:
+            stored = forecast_evaluation_effect(
+                runtime,
+                record,
+                reader.binding,
+                future,
+                offset,
+                state,
+                capture,
+                record.coverage,
+                evaluation_charge,
+            )
+        except ValueError:
+            # An unrepresentable complete capture is a failed capture, never a
+            # truncated result. Sealing preflight already proved the gap frame.
+            capture = d("PredictionRetrievalCapture", (), (), ())
+            state = CaptureState.OBSERVATION_GAP
+            stored = forecast_evaluation_effect(
+                runtime,
+                record,
+                reader.binding,
+                future,
+                offset,
+                state,
+                capture,
+                record.coverage,
+                evaluation_charge,
+            )
+        # An operational effect is the fixed evaluate-and-record handler. Its
+        # complete immutable INPUT descriptor is known before execution; the
+        # corresponding match/closure/record work fits this one allocation.
+        record.pool.budget.index = evaluated_budget
+        matched = state is not CaptureState.OBSERVATION_GAP and match(
+            record.commitment.target, capture.values[1], capture.values[0]
+        )
+        coverage = record.coverage + (
+            d("ForecastCoverage", offset, occurrence, state, matched),
+        )
+        status = status_after(
+            record.commitment.horizon, tuple(e.values[2] for e in coverage), matched
+        )
+        returned = ForecastOutcomeView(
+            outcome(record).commitment, status, _snapshot(coverage)
+        )
+        record.pending = (coverage, status, stored, returned)
+        if record.evaluation_owner is None:
+            record.evaluation_owner = _Owner(runtime)
+        return publish_forecast(runtime, record)
+
+    def deliver_event(handle, work, receipt, boundary):
+        """Fixed normal trusted path. Receipts cannot be supplied by cognition."""
+        with access(handle) as runtime:
+            with _pinned_cie_parent(runtime.parent) as (domain, _, _):
+                ingress = domain.ingress
+            with (
+                _pinned_prediction_core(
+                    ingress, receipt, delivery=True, boundary=boundary
+                ) as reader,
+                _pinned_cie_parent(runtime.parent),
+            ):
+                if runtime.prediction_policy is None:
+                    raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
+                records = tuple(runtime.forecasts[k] for k in sorted(runtime.forecasts))
+                returned = []
+                for record in records:
+                    if record.work is not work:
+                        raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
+                    if record.status is not ForecastStatus.PENDING:
+                        # Only retry authority-reducing cleanup. No capture,
+                        # evaluation, offset, or budget allocation is permitted.
+                        returned.append(retire(runtime, record, record.status))
+                        continue
+                    if boundary:
+                        returned.append(
+                            retire(runtime, record, ForecastStatus.BOUNDARY_TERMINATED)
+                        )
+                        continue
+                    stale = forecast_staleness(runtime, record, reader)
+                    if stale is not None:
+                        returned.append(retire(runtime, record, stale))
+                        continue
+                    with record.pool.budget.lock:
+                        try:
+                            returned.append(evaluate_forecast(runtime, record, reader))
+                        except (
+                            IngressAbort,
+                            ValueError,
+                            TypeError,
+                            RuntimeError,
+                            MemoryError,
+                            OSError,
+                        ):
+                            # No semantic fallback. The genuine Core event
+                            # stays committed; prepared publication, if any,
+                            # is retained within its original paid envelope.
+                            returned.append(
+                                d(
+                                    "ForecastProcessingFailure",
+                                    record.commitment.identity,
+                                    FailureCode.INTERNAL_CONTRACT_VIOLATION,
+                                )
+                            )
+                return tuple(returned)
+
+    def validate_forecast(record, work):
+        if type(record) is not _Forecast:
+            raise IngressAbort(FailureCode.INVALID_FORMAL_AUTHORITY)
+        with registry_lock:
+            entry = forecast_handles.get(id(record.fda))
+            if (
+                entry is None
+                or entry[0]() is not record.fda
+                or entry[2] is not record
+                or record.work is not work
+            ):
+                raise IngressAbort(FailureCode.INVALID_FORMAL_AUTHORITY)
+
+    def retire_environment(handle):
+        # Issuer holds the Core barrier. This is strictly authority reducing and
+        # must work before its issuer/domain becomes inaccessible.
+        with access(handle) as runtime, _pinned_cie_parent(runtime.parent):
+            records = tuple(runtime.forecasts[k] for k in sorted(runtime.forecasts))
+            return tuple(
+                retire(runtime, record, ForecastStatus.ENVIRONMENT_STALE)
+                for record in records
+            )
+
+    def validate_attachment(handle, work, ingress):
+        from .work import _validate_prediction_attachment
+
+        with (
+            access(handle) as runtime,
+            _pinned_cie_parent(runtime.parent) as (domain, _, _),
+        ):
+            if domain.ingress is not ingress or runtime.prediction_policy is None:
+                raise IngressAbort(FailureCode.INVALID_POLICY_BINDING)
+            _validate_prediction_attachment(
+                work, runtime.parent, runtime.cie, runtime.prediction_policy
+            )
+
+    def create_effect_runtime(
+        parent, cie, *, policy=None, reasoning_policy=None, prediction_policy=None
+    ):
         """Production bootstrap: no concrete semantic effect catalogue yet."""
-        return bootstrap(parent, cie, policy, False, reasoning_policy)
+        return bootstrap(
+            parent, cie, policy, False, reasoning_policy, prediction_policy
+        )
 
     def mechanical_harness(parent, cie, *, policy=None):
         """Private fixed test-only audit operations. No executor/handler argument."""
         return bootstrap(parent, cie, policy, True)
 
-    return EffectRuntime, create_effect_runtime, mechanical_harness
+    return (
+        EffectRuntime,
+        create_effect_runtime,
+        mechanical_harness,
+        deliver_event,
+        validate_forecast,
+        retire_environment,
+        validate_attachment,
+    )
 
 
-EffectRuntime, create_effect_runtime, _create_mechanical_effect_harness = (
-    _build_effect_system()
-)
+(
+    EffectRuntime,
+    create_effect_runtime,
+    _create_mechanical_effect_harness,
+    _deliver_prediction_event,
+    _validate_forecast_record,
+    _retire_prediction_environment,
+    _validate_prediction_attachment,
+) = _build_effect_system()
 del _build_effect_system

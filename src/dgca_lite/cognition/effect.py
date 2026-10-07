@@ -217,13 +217,20 @@ class EffectCommitView:
             self.commit_id.effect.canonical_descriptor()
         ) != canonical_identity_bytes(self.effect.canonical_descriptor()):
             raise ValueError("commit/effect mismatch")
-        if self.effect.effect_type == CanonicalDescriptor(
+        reasoning = self.effect.effect_type == CanonicalDescriptor(
             "EffectType", ("REASONING_PUBLISH",)
-        ):
+        )
+        prediction = self.effect.effect_type in (
+            CanonicalDescriptor("EffectType", ("PREDICTION_SEAL_AND_DELEGATE",)),
+            CanonicalDescriptor("EffectType", ("PREDICTION_EVALUATE_AND_RECORD",)),
+        )
+        if reasoning or prediction:
             # The complete effect is already present in commit_id. Avoid a
             # second copy of a bounded reasoning publication's proof graph.
             return CanonicalDescriptor(
-                "ReasoningEffectCommitView",
+                "ReasoningEffectCommitView"
+                if reasoning
+                else "PredictionEffectCommitView",
                 (
                     self.commit_id.canonical_descriptor(),
                     self.charge.canonical_descriptor(),
@@ -249,5 +256,7 @@ def clone_commit_view(policy, view, *, payload_limits=None):
     context = _snapshot(view.commit_id.authority_context)
     data = _snapshot(view.charge.canonical_descriptor())
     return EffectCommitView(
-        EffectCommitID(effect, context), effect, BudgetChargeView(*data.values[1:])
+        EffectCommitID(effect, context),
+        effect,
+        BudgetChargeView(*data.values[1:], source_kind=data.values[0]),
     )
