@@ -71,13 +71,19 @@ def derived_key(content, parents, scope):
     return AssertionSemanticKey(content, AssertionBasis.DERIVED, scope, roots)
 
 
-def semantic_records(entries, policy):
+def semantic_records(entries, policy, snapshot=None):
     if type(entries) is not tuple or len(entries) > 128:
         raise ValueError("bounded complete arena required")
     assertions, sources, derivations, constraints = {}, {}, {}, {}
+    from .modal import validate_supports
+
+    for ask, source in validate_supports(entries, snapshot):
+        sources.setdefault(key(ask), {})[key(source)] = source
     constraint_sources = set()
     for entry in entries:
-        payload = entry.payload
+        from .modal import resolve_payload
+
+        payload = resolve_payload(entry, entries, snapshot)
         if entry.category == "ASSERTION":
             ask = payload.values[0]
             assertion_record(ask)

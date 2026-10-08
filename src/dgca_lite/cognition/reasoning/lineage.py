@@ -18,7 +18,17 @@ def context_key(aec, constraint_keys, schema_identity):
     )
 
 
-def parent_witness(ask, snapshot, sources, derivations, context, conclusion, policy):
+def parent_witness(
+    ask,
+    snapshot,
+    sources,
+    derivations,
+    context,
+    conclusion,
+    policy,
+    *,
+    references=False,
+):
     source_set = sources.get(key(ask), {})
     if ask.basis is not AssertionBasis.DERIVED:
         if not source_set:
@@ -34,8 +44,14 @@ def parent_witness(ask, snapshot, sources, derivations, context, conclusion, pol
             return None
         record = min(paths, key=key)
         ancestry = record.values[3]
-        support = d(
-            "DerivationSupportReference", key(record.values[1]), key(record.values[2])
+        support = (
+            d("ModalDerivationSupportReference", record.values[1], record.values[2])
+            if references
+            else d(
+                "DerivationSupportReference",
+                key(record.values[1]),
+                key(record.values[2]),
+            )
         )
     if ask == conclusion or key(conclusion) in ancestry:
         return None
@@ -45,7 +61,12 @@ def parent_witness(ask, snapshot, sources, derivations, context, conclusion, pol
         snapshot.arena_version,
         snapshot.round_identity,
     )
-    return d("ParentAssertionWitness", key(ask), ref, key(support)), ancestry
+    return d(
+        "ParentAssertionWitness",
+        key(ask),
+        ref,
+        support if references and ask.basis is AssertionBasis.DERIVED else key(support),
+    ), ancestry
 
 
 def lineage(conclusion, schema_identity, roles, witnesses, context, gate, policy):

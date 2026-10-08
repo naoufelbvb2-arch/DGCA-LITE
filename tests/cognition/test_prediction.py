@@ -766,10 +766,9 @@ def test_prediction_adapter_retains_modal_root_and_never_negative_assertion(cont
     assert ask.content.descriptor.kind == "PredictionOutcomeStatement"
     assert ask.dependencies[0].kind is DependencyKind.PREDICTION
     assert ask.scope == results[0].commitment.scope
-    assert (
-        canonical_identity_bytes(view.canonical_descriptor())
-        == ask.content.descriptor.values[0]
-    )
+    from dgca_lite.cognition.prediction.adapters import semantic_identity
+
+    assert semantic_identity(view) == ask.content.descriptor.values[0]
     for wrong in ("EXTERNAL_OBSERVATION", "FORMAL_GIVEN", "CAUSES"):
         with pytest.raises(ValueError):
             replace(view, prediction_class=wrong)
@@ -1281,9 +1280,15 @@ def test_prediction_dependency_union_and_complete_reasoning_capacity(context):
         branch=1,
         prediction_views=(view,),
     )
-    # Complete repeated proof descriptors exceed the existing Unit-7 envelope.
-    # Never truncate the modal view or enlarge frozen defaults to admit it.
-    assert result.status == "CAPACITY_ABORT" and not result.assertions
+    # Unit-10 normalization retains the entire view once and exact local proof
+    # references, admitting this lawful chain without changing any bound.
+    assert result.status == "FIXED_POINT"
+    assert any(
+        a.basis is AssertionBasis.DERIVED
+        and a.content == conclusion
+        and a.dependencies == modal.dependencies
+        for a in result.assertions
+    )
     formal = issuer.formal_reasoning.accept(conditional).semantic_key
     derived = derived_key(conclusion, (formal, modal), modal.scope)
     assert derived.basis is AssertionBasis.DERIVED

@@ -41,8 +41,8 @@ def validate(content, *, allowed_referents=None):
         "SingleValued": (CanonicalDescriptor,),
         "Assign": (CanonicalDescriptor,) * 3,
         "InternalRetrievalStatement": (bytes,),
-        "PredictionOutcomeStatement": (bytes,),
-        "CausalResultStatement": (bytes,),
+        "PredictionOutcomeStatement": (CanonicalDescriptor,),
+        "CausalResultStatement": (CanonicalDescriptor,),
         "ObservedCoreFrontier": (tuple, tuple),
     }
 
@@ -84,11 +84,14 @@ def validate(content, *, allowed_referents=None):
                 raise ValueError("bounded nonempty proposition name required")
             if node.kind == "InternalRetrievalStatement" and len(node.values[0]) > 8192:
                 raise ValueError("bounded retrieval literal required")
-            if (
-                node.kind in ("PredictionOutcomeStatement", "CausalResultStatement")
-                and not 0 < len(node.values[0]) <= 65536
-            ):
-                raise ValueError("bounded typed prediction literal required")
+            if node.kind == "PredictionOutcomeStatement":
+                from ..prediction.adapters import validate_semantic_identity
+
+                validate_semantic_identity(node.values[0])
+            if node.kind == "CausalResultStatement":
+                from ..causality.adapters import validate_semantic_identity
+
+                validate_semantic_identity(node.values[0])
             if node.kind == "ObservedCoreFrontier":
                 frontier, activation = node.values
                 if len(frontier) > 256 or len(activation) > 256:

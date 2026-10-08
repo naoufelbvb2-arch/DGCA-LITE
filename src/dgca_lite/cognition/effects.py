@@ -460,6 +460,15 @@ def _build_effect_system():
                 "EffectAuthorityContext",
                 (frozen.owner_binding, frozen.environment_revision, snapshot),
             )
+            if reasoning and any(
+                entry.values[0] in ("PREDICTION_VIEW", "CAUSAL_RESULT_VIEW")
+                for entry in frozen.canonical_payload.values[1]
+            ):
+                # Owner/environment are already exact fields of the effect.
+                # A local snapshot reference adds only its distinct identity;
+                # repeating its complete environment would amplify the modal
+                # publication again. The genuine CIE gate still resolves it.
+                context = d("ModalReasoningEffectContext", snapshot_ref(snapshot))
             identity = EffectCommitID(frozen, context)
             return frozen, snapshot, contract, identity
         except (TypeError, ValueError, AttributeError) as error:

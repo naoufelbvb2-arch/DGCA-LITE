@@ -640,7 +640,9 @@ def _build_cie_system():
             checked_snapshot(runtime, candidate)
             from .reasoning.assertions import semantic_records
 
-            semantic_records(candidate.entries, runtime.reasoning_policy)
+            semantic_records(
+                candidate.entries, runtime.reasoning_policy, candidate.binding
+            )
             return epoch, candidate
 
     def reasoning_capacity(epoch, maximum_additions):

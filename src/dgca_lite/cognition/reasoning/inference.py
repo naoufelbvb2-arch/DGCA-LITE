@@ -16,6 +16,22 @@ from .schemas import schema
 FORMAL_RULE_BASES = (AssertionBasis.FORMAL_GIVEN, AssertionBasis.FORMAL_ASSUMPTION)
 
 
+def finding_identity(finding, entries):
+    if any(e.category in ("PREDICTION_VIEW", "CAUSAL_RESULT_VIEW") for e in entries):
+        return d(
+            "ModalFindingWitnessIdentity",
+            finding.values[0],
+            finding.values[-1],
+            finding.values[6],
+        )
+    return d(
+        "FindingWitnessIdentity",
+        key(finding.values[0]),
+        finding.values[-1],
+        key(finding.values[6]),
+    )
+
+
 def active_context(entries, snapshot, branch):
     if type(branch) is not int or branch < 0:
         raise ValueError("canonical branch index required")
@@ -33,13 +49,23 @@ def active_context(entries, snapshot, branch):
 
 
 def candidates(entries, snapshot, branch, policy):
-    assertions, sources, derivations, constraints = semantic_records(entries, policy)
+    assertions, sources, derivations, constraints = semantic_records(
+        entries, policy, snapshot
+    )
     aec = active_context(entries, snapshot, branch)
+    modal = any(
+        e.category in ("PREDICTION_VIEW", "CAUSAL_RESULT_VIEW") for e in entries
+    )
     pool = tuple(a for _, a in sorted(assertions.items()) if aec.admits(a))
     active_keys = tuple(constraints[k].values[0] for k in sorted(constraints))
     result = {}
+    from .modal import resolve_payload
+
     completed = {
-        key(e.identity) for e in entries if e.payload.kind == "CompletedInferenceUse"
+        key(payload.values[1])
+        for e in entries
+        for payload in (resolve_payload(e, entries, snapshot),)
+        if payload.kind == "CompletedInferenceUse"
     }
     for family in InferenceFamily:
         schema_identity = schema(family)
@@ -89,7 +115,16 @@ def candidates(entries, snapshot, branch, policy):
             ):
                 continue
             witnesses = tuple(
-                parent_witness(p, snapshot, sources, derivations, context, ask, policy)
+                parent_witness(
+                    p,
+                    snapshot,
+                    sources,
+                    derivations,
+                    context,
+                    ask,
+                    policy,
+                    references=modal,
+                )
                 for p in parents
             )
             if any(w is None for w in witnesses):
@@ -123,7 +158,7 @@ def candidates(entries, snapshot, branch, policy):
 def evaluate(
     entries, snapshot, branch, frontier, policy, query_mode="EXISTS_INCOMPATIBILITY"
 ):
-    assertions, _, _, constraints = semantic_records(entries, policy)
+    assertions, _, _, constraints = semantic_records(entries, policy, snapshot)
     aec = active_context(entries, snapshot, branch)
     output = []
     incomplete = False
@@ -149,12 +184,7 @@ def evaluate(
                 output.append(
                     ArenaEntry(
                         "CONSTRAINT_FINDING",
-                        d(
-                            "FindingWitnessIdentity",
-                            key(finding.values[0]),
-                            finding.values[-1],
-                            key(finding.values[6]),
-                        ),
+                        finding_identity(finding, entries),
                         finding,
                     )
                 )
@@ -171,12 +201,7 @@ def evaluate(
                 output.append(
                     ArenaEntry(
                         "CONSTRAINT_FINDING",
-                        d(
-                            "FindingWitnessIdentity",
-                            key(finding.values[0]),
-                            finding.values[-1],
-                            key(finding.values[6]),
-                        ),
+                        finding_identity(finding, entries),
                         finding,
                     )
                 )
@@ -208,7 +233,14 @@ def evaluate(
                 ArenaEntry("ASSERTION", d("ASK", key(ask)), d("AssertionRecord", ask)),
                 ArenaEntry(
                     "DERIVATION_WITNESS",
-                    d("DerivationSupportIdentity", key(record.values[1]), key(context)),
+                    d("ModalDerivationSupportIdentity", record.values[1], context)
+                    if any(
+                        e.category in ("PREDICTION_VIEW", "CAUSAL_RESULT_VIEW")
+                        for e in entries
+                    )
+                    else d(
+                        "DerivationSupportIdentity", key(record.values[1]), key(context)
+                    ),
                     record,
                 ),
                 ArenaEntry(

@@ -40,6 +40,7 @@ class PredictionOutcomeCognitiveView:
         identity = self.commitment_identity
         if (
             type(identity) is not CanonicalDescriptor
+            or type(identity.kind) is not str
             or identity.kind != "ForecastCommitmentID"
             or type(identity.values) is not tuple
             or len(identity.values) != 1
@@ -48,6 +49,7 @@ class PredictionOutcomeCognitiveView:
         data = identity.values[0]
         if (
             type(data) is not CanonicalDescriptor
+            or type(data.kind) is not str
             or data.kind != "ForecastCommitment"
             or type(data.values) is not tuple
             or len(data.values) != 11
@@ -72,6 +74,7 @@ class PredictionOutcomeCognitiveView:
         if future is not None:
             if (
                 type(future) is not CanonicalDescriptor
+                or type(future.kind) is not str
                 or future.kind != "FutureTrustedOccurrenceID"
                 or type(future.values) is not tuple
                 or len(future.values) != 2
@@ -113,17 +116,13 @@ def prediction_outcome_view(outcome):
 
 
 def reasoning_view(view):
-    """Literal readonly statement, never a formal AST/proposition decoder.
-
-    The byte payload is the COMPLETE canonical typed view, not a hash. Generic
-    schemas do not inspect it, and its mandatory modal dependency is retained.
-    Copies remain data and cannot grant trusted/formal/operational authority.
-    """
+    """Exact readonly semantic statement. This creates data, never authority."""
     if type(view) is not PredictionOutcomeCognitiveView:
         raise TypeError("typed capability-free prediction view required")
-    image = canonical_identity_bytes(view.canonical_descriptor())
+    view.canonical_descriptor()
+    identity = semantic_identity(view)
     ask = AssertionSemanticKey(
-        ground("PredictionOutcomeStatement", image),
+        ground("PredictionOutcomeStatement", identity),
         AssertionBasis.PREDICTION_VIEW,
         view.prediction_scope_descriptor,
         (view.prediction_dependency_root,),
@@ -131,6 +130,61 @@ def reasoning_view(view):
     source = SourceAssertionKey(
         "PREDICTION_VIEW",
         view.prediction_dependency_root.origin_authority_binding,
-        d("PredictionResultOccurrence", image),
+        d("PredictionResultOccurrence", identity),
     )
     return d("IngressAssertionView", ask, source)
+
+
+def semantic_identity(view):
+    return d(
+        "PredictionOutcomeSemanticIdentity",
+        d(
+            "ExactForecastCommitmentIdentity",
+            canonical_identity_bytes(view.commitment_identity),
+        ),
+        view.prediction_class,
+        view.outcome_status,
+        view.future_observation_provenance_descriptor,
+    )
+
+
+def validate_semantic_identity(identity):
+    if (
+        type(identity) is not CanonicalDescriptor
+        or type(identity.kind) is not str
+        or identity.kind != "PredictionOutcomeSemanticIdentity"
+        or type(identity.values) is not tuple
+        or len(identity.values) != 4
+    ):
+        raise ValueError("closed prediction semantic identity required")
+    # The finite closed encoder rejects opaque nested members before any
+    # semantic comparison/constructor can invoke caller-defined hooks.
+    canonical_identity_bytes(identity)
+    commitment_id, prediction_class, status, future = identity.values
+    if (
+        type(commitment_id) is not CanonicalDescriptor
+        or type(commitment_id.kind) is not str
+        or commitment_id.kind != "ExactForecastCommitmentIdentity"
+        or type(commitment_id.values) is not tuple
+        or len(commitment_id.values) != 1
+        or type(commitment_id.values[0]) is not bytes
+        or not 0 < len(commitment_id.values[0]) <= 65536
+        or type(prediction_class) is not str
+        or prediction_class != "ROOT_ANCHORED_FORECAST"
+        or type(status) is not ForecastStatus
+    ):
+        raise ValueError("closed exact forecast source identity required")
+    if future is not None:
+        if (
+            type(future) is not CanonicalDescriptor
+            or type(future.kind) is not str
+            or future.kind != "FutureTrustedOccurrenceID"
+            or type(future.values) is not tuple
+            or len(future.values) != 2
+        ):
+            raise ValueError("closed future identity required")
+        FutureTrustedOccurrenceID(*future.values)
+
+
+def prediction_reasoning_claim(view):
+    return reasoning_view(view).values[0].content

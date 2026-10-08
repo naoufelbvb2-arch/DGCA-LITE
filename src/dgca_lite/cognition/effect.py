@@ -182,11 +182,44 @@ class PreparedEffect:
             or not 0 <= self.unit_ordinal < 256
         ):
             raise TypeError("invalid closed prepared effect")
+        snapshot = self.snapshot_binding
+        payload = self.effect.canonical_payload
+        if (
+            type(payload) is CanonicalDescriptor
+            and type(payload.kind) is str
+            and payload.kind == "ReasoningPublication"
+        ):
+            if type(payload.values) is not tuple or len(payload.values) != 3:
+                raise ValueError("reasoning publication outer shape")
+            entries = payload.values[1]
+            if type(entries) is not tuple or len(entries) > 128:
+                raise ValueError("reasoning publication outer bound")
+            # No arbitrary member attribute is read until the closed envelope
+            # and shared traversal bound have rejected hostile nested data.
+            canonical_identity_bytes(payload)
+        if (
+            type(payload) is CanonicalDescriptor
+            and type(payload.kind) is str
+            and payload.kind == "ReasoningPublication"
+            and type(payload.values) is tuple
+            and len(payload.values) == 3
+            and any(
+                entry.values[0] in ("PREDICTION_VIEW", "CAUSAL_RESULT_VIEW")
+                or entry.values[1].kind
+                in ("ReferencedReasoningIdentity", "ReasoningProofArenaRef")
+                for entry in payload.values[1]
+            )
+        ):
+            # Preserve the EXACT typed snapshot identity, not a hash. The live
+            # gate still consumes/validates self.snapshot_binding separately.
+            snapshot = CanonicalDescriptor(
+                "ExactModalPublicationSnapshot", (canonical_identity_bytes(snapshot),)
+            )
         return CanonicalDescriptor(
             "PreparedEffect",
             (
                 self.effect.canonical_descriptor(),
-                self.snapshot_binding,
+                snapshot,
                 self.charge.canonical_descriptor(),
                 self.unit_ordinal,
             ),

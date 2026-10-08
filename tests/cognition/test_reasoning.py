@@ -294,7 +294,17 @@ def test_nonformal_rule_role_rejected_before_support_matching(context, basis, fa
                     continue
                 e = ArenaEntry("ASSERTION", d("ASK", ask), d("AssertionRecord", ask))
             entries.append(e)
-        assert not candidates(tuple(entries), snapshot.binding, 0, ReasoningPolicy())
+        if basis in (AssertionBasis.PREDICTION_VIEW, AssertionBasis.CAUSAL_RESULT_VIEW):
+            # The normalized adapter boundary now rejects this forged modal
+            # rule before matching: it has no complete view/source support.
+            # Rejecting the missing provenance must not be relaxed to admit
+            # the forged assertion merely to exercise the later role check.
+            with pytest.raises(ValueError, match="complete referenced provenance"):
+                candidates(tuple(entries), snapshot.binding, 0, ReasoningPolicy())
+        else:
+            assert not candidates(
+                tuple(entries), snapshot.binding, 0, ReasoningPolicy()
+            )
     finally:
         close(root, auth, ledger, cie)
 

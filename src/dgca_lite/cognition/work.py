@@ -75,6 +75,16 @@ def _permit_identity(work):
     # Seed additionally binds every exact authorized source descriptor. This is
     # a complete local reference identity, never a hash or caller-chosen key.
     _, branch, extra = work.frozen_input.values
+    if work.contract.operation_type is ReasoningOperation.SEED and any(
+        source.kind == "ModalIngressView" for source in extra
+    ):
+        # Exact typed source identity images, never digests. Authorization still
+        # compares the COMPLETE frozen input to the genuine source group. Keep
+        # the permit shell from traversing that full modal tree a second time.
+        extra = CanonicalDescriptor(
+            "ExactModalSeedGroupIdentity",
+            tuple(canonical_identity_bytes(source) for source in extra),
+        )
     return CanonicalDescriptor(
         "ExactReasoningWorkIdentity",
         (
@@ -360,6 +370,7 @@ def _build_work_system():
                 with _pinned_cie_work(
                     runtime.cie, cie, item, frozen.snapshot_binding, core
                 ) as epoch:
+                    reasoning_arena = None
                     if type(frozen.contract.operation_type) is ReasoningOperation:
                         from .cie import _check_reasoning_capacity
                         from .reasoning.runtime import (
@@ -385,17 +396,13 @@ def _build_work_system():
                                 internal_retrieval_view(v, frozen.snapshot_binding)
                                 for v in internal_results
                             )
-                            from .prediction.adapters import reasoning_view
+                            from .reasoning.modal import source_input
 
                             expected_sources += tuple(
-                                reasoning_view(v) for v in prediction_views
+                                source_input(v) for v in prediction_views
                             )
-                            from .causality.adapters import (
-                                reasoning_view as causal_reasoning_view,
-                            )
-
                             expected_sources += tuple(
-                                causal_reasoning_view(v) for v in causal_views
+                                source_input(v) for v in causal_views
                             )
                         discovered = None
                         if (
@@ -416,8 +423,22 @@ def _build_work_system():
                             discovered,
                             runtime.reasoning_policy,
                         )
+                        if type(frozen.frozen_input.values[0]) is CanonicalDescriptor:
+                            # A bounded, private frozen worker input replacing
+                            # the repeated Arena tree formerly in FrozenWork.
+                            # It lives only on this existing one-shot WEP and is
+                            # released by the same operational cleanup paths.
+                            reasoning_arena = _snapshot(
+                                tuple(
+                                    e.canonical_descriptor()
+                                    for e in epoch.snapshot.entries
+                                )
+                            )
                         _check_reasoning_capacity(
-                            epoch, group_capacity(frozen, runtime.reasoning_policy)
+                            epoch,
+                            group_capacity(
+                                frozen, runtime.reasoning_policy, reasoning_arena
+                            ),
                         )
                     owner = item.work_owner
                     if owner is None:
@@ -463,6 +484,7 @@ def _build_work_system():
                             canonical_identity_bytes(frozen.canonical_descriptor()),
                             binding,
                         )
+                        record.origin = reasoning_arena
                         local_records = dict(records)
                         local_records[id(token)] = record
                         staged_owner = (epoch + 1, local_records)
@@ -521,6 +543,15 @@ def _build_work_system():
                         raise IngressAbort(FailureCode.INVALID_INPUT)
                     binding = _snapshot(record.binding)
                     context = CanonicalDescriptor("PureExecutionContext", (binding,))
+                    reasoning_input = frozen.frozen_input
+                    if (
+                        type(frozen.contract.operation_type) is ReasoningOperation
+                        and record.origin is not None
+                    ):
+                        reasoning_input = CanonicalDescriptor(
+                            "ReasoningInput",
+                            (record.origin, *frozen.frozen_input.values[1:]),
+                        )
                     # One-shot claim occurs BEFORE leaving owner barriers.
                     record.state = "RUNNING"
                 try:
@@ -529,7 +560,7 @@ def _build_work_system():
 
                         output = compute(
                             frozen.contract.operation_type,
-                            frozen.frozen_input,
+                            reasoning_input,
                             frozen.snapshot_binding,
                             runtime.reasoning_policy,
                         )
@@ -545,8 +576,8 @@ def _build_work_system():
                     with _pinned_cie_parent(runtime.parent), record.owner.lock:
                         record.state = "RETIRED"
                         record.work = record.image = record.binding = record.output = (
-                            None
-                        )
+                            record.origin
+                        ) = None
                     raise
                 with _pinned_cie_parent(runtime.parent), record.owner.lock:
                     if record.state != "RETIRED":
@@ -798,12 +829,10 @@ def _build_work_system():
                     internal_retrieval_view(v, snapshot.binding)
                     for v in internal_results
                 )
-                from .prediction.adapters import reasoning_view
+                from .reasoning.modal import source_input
 
-                sources += tuple(reasoning_view(v) for v in prediction_views)
-                from .causality.adapters import reasoning_view as causal_reasoning_view
-
-                sources += tuple(causal_reasoning_view(v) for v in causal_views)
+                sources += tuple(source_input(v) for v in prediction_views)
+                sources += tuple(source_input(v) for v in causal_views)
                 return CanonicalDescriptor(
                     "ReasoningInput",
                     (
